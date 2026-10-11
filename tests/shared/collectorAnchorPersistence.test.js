@@ -867,14 +867,19 @@ test('old persisted anchors upgrade conversation identities once without changin
   db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('app-thread', '{}');
   db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('provider', 'app-thread', 'codex',
     JSON.stringify({ nativeThreadRef: { nativeId: native, driver: 'codex', strength: 'strong' } }));
+  db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('devin-app', '{}');
+  db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('devin-provider', 'devin-app', 'acpRegistry',
+    JSON.stringify({ providerInstanceId: 'configured-devin', nativeThreadRef: { nativeId: 'opaque-devin', driver: 'acpRegistry', strength: 'strong' } }));
+  fs.writeFileSync(path.join(home, 'settings.json'), JSON.stringify({ providerInstances: { 'configured-devin': { driver: 'acpRegistry', config: { agentId: 'devin' } } } }));
   db.close();
   const period = (history = false) => normalizePeriod({ totalTokens: history ? 40 : 10, costUsd: history ? 4 : 1,
     sessions: { 'codex:today': { client: 'codex', sessionId: 'today', totalTokens: 10, costUsd: 1 },
-      ...(history ? { 'codex:historical': { client: 'codex', sessionId: 'historical', totalTokens: 30, costUsd: 3 } } : {}) } });
+      ...(history ? { 'codex:historical': { client: 'codex', sessionId: 'historical', totalTokens: 30, costUsd: 3 },
+        'devin:opaque-devin': { client: 'devin', sessionId: 'opaque-devin', totalTokens: 0, costUsd: 0 } } : {}) } });
   const file = path.join(home, 'collector-anchor.json');
   const capturedAt = new Date().toISOString();
   fs.writeFileSync(file, JSON.stringify({ dateKey: localTodayKey(), today: period(), month: period(true), allTime: period(true),
-    configFingerprint: configFingerprint('codex', '2024-01-01', false), fullScanAt: capturedAt }));
+    configFingerprint: configFingerprint('codex', '2024-01-01', false), fullScanAt: capturedAt, sessionIdentityVersion: 1 }));
   const scans = [], resolved = [], updates = [];
   const options = { ...baseOptions, clients: 'codex', homeDir: home, projectsEnabled: false,
     intervalMs: 3600000, watchEnabled: false, wslScanEnabled: false, sessionActivityPolling: false,
@@ -893,12 +898,13 @@ test('old persisted anchors upgrade conversation identities once without changin
   assert.equal(scans.length, 1, 'migration uses the ordinary today scan, never new historical token scans');
   assert.equal(resolved.includes('historical'), false, 'migration only reads identity headers, never full historical metadata');
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.equal(saved.sessionIdentityVersion, 1);
+  assert.equal(saved.sessionIdentityVersion, 2);
   assert.equal(saved.fullScanAt, capturedAt, 'metadata migration does not pretend to be a new full scan');
   assert.equal(saved.today.totalTokens, 10, 'frozen delta baseline is retained');
   assert.equal(saved.month.totalTokens, 40);
   assert.equal(saved.month.sessions['codex:historical'].nativeSessionId, native);
   assert.equal(saved.month.sessions['codex:historical'].t3ThreadId, 'app-thread');
+  assert.equal(saved.month.sessions['devin:opaque-devin'].t3ThreadId, 'devin-app', 'version-one anchors receive the added client bindings');
   assert.equal(updates[0].month.totalTokens, 50, 'today delta is applied exactly once');
   assert.equal(updates[0].month.costUsd, 5);
   handle.stop();

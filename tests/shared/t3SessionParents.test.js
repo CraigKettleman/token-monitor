@@ -25,8 +25,8 @@ function store(t) {
   const thread = (id, parent, relationship = 'subagent') => db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, NULL, ?)').run(
     id, 'New thread', JSON.stringify({ lineage: { parentThreadId: parent || null, relationshipToParent: parent ? relationship : null } })
   );
-  const provider = (id, app, nativeId, driver = 'codex', strength = 'strong') => db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run(
-    id, app, driver, JSON.stringify({ nativeThreadRef: { nativeId, driver, strength } })
+  const provider = (id, app, nativeId, driver = 'codex', strength = 'strong', instanceId) => db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run(
+    id, app, driver, JSON.stringify({ providerInstanceId: instanceId, nativeThreadRef: { nativeId, driver, strength } })
   );
   const delegation = (childProvider, parentProvider, parentApp, id = childProvider) => {
     db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)').run(`root-${id}`, parentApp, `root-${id}`, 'root_turn', parentProvider);
@@ -44,6 +44,105 @@ function pair(s, childDriver = 'claudeAgent', parentDriver = 'codex') {
   s.provider('child-provider', 'child', 'child-native', childDriver);
   s.delegation('child-provider', 'launch-provider', 'parent');
 }
+
+function registry(s, instances) {
+  fs.writeFileSync(path.join(path.dirname(s.file), 'settings.json'), JSON.stringify({ providerInstances: instances }));
+}
+
+test('ACP agent identity comes from its configured instance, with mixed-provider delegation and exact opaque ids', t => {
+  const s = store(t);
+  registry(s, { arbitrary: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.thread('parent'); s.thread('child', 'parent');
+  s.provider('launch-provider', 'parent', 'parent-native');
+  s.provider('main-devin', 'parent', 'like-paperback', 'acpRegistry', 'strong', 'arbitrary');
+  s.provider('child-provider', 'child', 'bird-notebook', 'acpRegistry', 'strong', 'arbitrary');
+  s.delegation('child-provider', 'launch-provider', 'parent'); runningTask(s);
+  const periods = { month: normalizePeriod({ sessions: {
+    a: { client: 'codex', sessionId: 'parent-native', totalTokens: 10, costUsd: 1, lastUsedAt: new Date().toISOString() },
+    b: { client: 'devin', sessionId: 'like-paperback', totalTokens: 20, costUsd: 2, lastUsedAt: new Date().toISOString() },
+    c: { client: 'devin', sessionId: 'bird-notebook', totalTokens: 30, costUsd: 3, lastUsedAt: new Date().toISOString() }
+  } }) };
+  const before = Object.entries(periods.month.sessions).map(([key, row]) => [key, row.totalTokens, row.costUsd]);
+  applyT3SessionParents(periods, s.home, { env: {} });
+  const ss = periods.month.sessions;
+  assert.equal(ss['devin:like-paperback'].t3ThreadId, 'parent');
+  assert.equal(ss['devin:bird-notebook'].t3ThreadId, 'child');
+  assert.equal(ss['devin:bird-notebook'].parentSessionId, 'parent-native');
+  assert.equal(ss['devin:bird-notebook'].parentClient, 'codex');
+  const wire = normalizePeriod(periods.month);
+  assert.equal(wire.sessions['devin:bird-notebook'].t3ThreadId, 'child');
+  assert.equal(mergePeriods(wire).sessions['devin:like-paperback'].t3ThreadId, 'parent');
+  assert.deepEqual(Object.entries(ss).map(([key, row]) => [key, row.totalTokens, row.costUsd]), before);
+  const dock = require('../../src/electron/renderer/edgeDock/presentation');
+  const grouped = dock.recentSessionRows({ periods }, 100);
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].groupRows.length, 3);
+  assert.equal(grouped[0].subagentCount, 1);
+  assert.equal(grouped[0].totalTokens, 60);
+  assert.equal(grouped[0].costUsd, 6);
+  delete ss['codex:parent-native']; delete ss['devin:bird-notebook'].parentSessionId; delete ss['devin:bird-notebook'].parentClient;
+  applyT3SessionParents(periods, s.home, { env: {} });
+  assert.equal(ss['devin:bird-notebook'].parentSessionId, 'like-paperback', 'visible main provider switch is a proven parent');
+});
+
+for (const driver of ['cursor', 'opencode', 'grok', 'muse']) {
+  test(`T3 ${driver} uses shared delegation without changing the accounting client`, t => {
+    const s = store(t); pair(s, driver, driver);
+    assert.deepEqual(s.read(['child-native']), new Map([[`${driver}:child-native`, {
+      parentClient: driver, parentNativeId: 'parent-native'
+    }]]));
+  });
+}
+
+test('registry instances with identical native ids stay in distinct accounting client spaces', t => {
+  const s = store(t);
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'devin' } }, b: { driver: 'acpRegistry', config: { agentId: 'opencode' } } });
+  s.thread('devin-main'); s.thread('open-main');
+  s.provider('a', 'devin-main', 'opaque-native', 'acpRegistry', 'strong', 'a');
+  s.provider('b', 'open-main', 'opaque-native', 'acpRegistry', 'strong', 'b');
+  const read = () => readT3SessionRelations(['opaque-native'], { homeDir: s.home, env: {} });
+  assert.equal(read().get('devin:opaque-native').threadId, 'devin-main');
+  assert.equal(read().get('opencode:opaque-native').threadId, 'open-main');
+  s.thread('conflict'); s.provider('conflict', 'conflict', 'opaque-native', 'acpRegistry', 'strong', 'a');
+  assert.equal(read().has('devin:opaque-native'), false);
+  assert.equal(read().get('opencode:opaque-native').threadId, 'open-main');
+});
+
+test('ACP configuration, strong native references and explicit lineage are all required', async t => {
+  for (const [name, config] of [
+    ['missing instance', null], ['local command', { agentId: 'devin', source: 'local' }],
+    ['executable override', { agentId: 'devin', commandPath: '/custom/devin' }],
+    ['unknown registry agent', { agentId: 'unknown' }], ['prototype key', { agentId: 'constructor' }]
+  ]) await t.test(name, t => {
+    const s = store(t); s.thread('parent'); s.thread('child', 'parent');
+    if (config) registry(s, { acpRegistry_devin: { driver: 'acpRegistry', config } });
+    s.provider('launch-provider', 'parent', 'parent-native');
+    s.provider('child-provider', 'child', 'bird-notebook', 'acpRegistry', 'strong', 'acpRegistry_devin');
+    s.delegation('child-provider', 'launch-provider', 'parent');
+    assert.equal(readT3SessionRelations(['bird-notebook'], { homeDir: s.home, env: {} }).size, 0);
+  });
+  const s = store(t);
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.thread('fork', 'parent', 'fork');
+  s.provider('fork', 'fork', 'bird-notebook', 'acpRegistry', 'strong', 'a');
+  assert.equal(s.read(['bird-notebook']).size, 0);
+  assert.equal(readT3SessionRelations(['BIRD-NOTEBOOK'], { homeDir: s.home, env: {} }).size, 0, 'opaque identities are case sensitive');
+});
+
+test('accepted opaque ACP run identities survive native replacement with provider/root ownership validation', t => {
+  const s = store(t); s.thread('main');
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.provider('provider', 'main', 'current-native', 'acpRegistry', 'strong', 'a');
+  s.db.exec(`CREATE TABLE orchestration_v2_projection_run_attempts (
+    thread_id TEXT, provider_thread_id TEXT, root_node_id TEXT, status TEXT, payload_json TEXT)`);
+  s.db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)').run('root', 'main', 'root', 'root_turn', 'provider');
+  const insert = s.db.prepare('INSERT INTO orchestration_v2_projection_run_attempts VALUES (?, ?, ?, ?, ?)');
+  insert.run('main', 'provider', 'root', 'completed', JSON.stringify({ nativeThreadId: 'old-native' }));
+  insert.run('main', 'provider', 'root', 'queued', JSON.stringify({ nativeThreadId: 'queued-native' }));
+  insert.run('other', 'provider', 'root', 'completed', JSON.stringify({ nativeThreadId: 'other-native' }));
+  const facts = readT3SessionRelations(['old-native', 'current-native', 'queued-native', 'other-native'], { homeDir: s.home, env: {} });
+  assert.deepEqual([...facts.keys()].sort(), ['devin:current-native', 'devin:old-native']);
+});
 
 test('T3 delegation binds the launch provider, with Codex and Claude cross-provider children', (t) => {
   const s = store(t);
@@ -352,23 +451,26 @@ test('accepted run identities survive native replacement; pending or wrongly own
   assert.ok(plans.some(detail => detail.startsWith('SEARCH root USING INDEX') && detail.includes('(node_id=?)')));
 });
 
-test('T3 identities survive wire, real SQLite archive and title removal while cross-device conflicts fail closed', t => {
+for (const client of ['claude', 'devin']) test(`T3 ${client} identities survive wire, real SQLite archive and title removal while cross-device conflicts fail closed`, t => {
   const { createSessionUsageArchiveStore } = require('../../src/shared/usage/sessionUsageArchiveStore');
   const s = store(t); const make = t3ThreadId => normalizePeriod({ sessions: {
-    a: { client: 'claude', sessionId: 'a', totalTokens: 10, costUsd: 1, t3ThreadId, title: 'private' }
+    a: { client, sessionId: 'a', totalTokens: 10, costUsd: 1, t3ThreadId, title: 'private' }
   } });
   const period = make('app-main');
+  const worker = require('../../worker/src/shared/usage');
+  assert.equal(worker.normalizePeriod(period).sessions[`${client}:a`].t3ThreadId, 'app-main');
+  assert.equal(worker.mergePeriods(period, make('different')).sessions[`${client}:a`].t3ThreadId, undefined);
   const dbPath = path.join(s.home, 'archive.sqlite');
   const archive = createSessionUsageArchiveStore({ databasePath: dbPath, legacyPath: path.join(s.home, 'absent.json') });
   const result = archive.capture({ today: period, month: period, allTime: period }, new Date());
   assert.equal(result.error, null); archive.close();
   const reopened = createSessionUsageArchiveStore({ databasePath: dbPath, legacyPath: path.join(s.home, 'absent.json') });
   t.after(() => reopened.close());
-  assert.equal(reopened.read().sessions['claude:a'].periods.today.t3ThreadId, 'app-main');
-  const scrubbed = stripSessionTextFromPeriod(period).sessions['claude:a'];
+  assert.equal(reopened.read().sessions[`${client}:a`].periods.today.t3ThreadId, 'app-main');
+  const scrubbed = stripSessionTextFromPeriod(period).sessions[`${client}:a`];
   assert.equal(scrubbed.t3ThreadId, 'app-main'); assert.equal(scrubbed.title, undefined);
-  assert.equal(mergePeriods(period, make('different'), period).sessions['claude:a'].t3ThreadId, undefined);
-  assert.equal(make('invalid thread text').sessions['claude:a'].t3ThreadId, undefined);
+  assert.equal(mergePeriods(period, make('different'), period).sessions[`${client}:a`].t3ThreadId, undefined);
+  assert.equal(make('invalid thread text').sessions[`${client}:a`].t3ThreadId, undefined);
 });
 
 function runningTask(s, childProvider = 'child-provider', parentApp = 'parent', childApp = 'child') {
@@ -449,4 +551,29 @@ test('three active records in one T3 family become one running group through acc
   assert.equal(pretokenRows[0].groupRows.length, 3);
   assert.equal(pretokenRows[0].subagentCount, 2);
   assert.equal(pretokenRows[0].totalTokens, 100, 'pre-token children contribute no duplicate usage');
+});
+
+
+test('ACP projection instance column must agree with its payload and uses only colocated settings', t => {
+  const s = store(t); s.thread('main');
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.provider('a', 'main', 'opaque-native', 'acpRegistry', 'strong', 'a');
+  s.db.exec('ALTER TABLE orchestration_v2_projection_provider_threads ADD COLUMN provider_instance_id TEXT');
+  s.db.exec("UPDATE orchestration_v2_projection_provider_threads SET provider_instance_id = 'a'");
+  const read = () => readT3SessionRelations(['opaque-native'], { homeDir: s.home, env: {} });
+  assert.equal(read().get('devin:opaque-native').threadId, 'main');
+  s.db.exec("UPDATE orchestration_v2_projection_provider_threads SET provider_instance_id = 'different'");
+  assert.equal(read().size, 0);
+  s.db.exec("UPDATE orchestration_v2_projection_provider_threads SET provider_instance_id = 'a'");
+  fs.writeFileSync(path.join(path.dirname(s.file), 'settings.json'), 'malformed');
+  assert.equal(read().size, 0);
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.db.exec("UPDATE orchestration_v2_projection_provider_threads SET payload_json = json_set(payload_json, '$.nativeThreadRef.strength', 'weak')");
+  assert.equal(read().size, 0);
+});
+
+test('unknown drivers and Pi file-path identities remain unbound instead of guessing an accounting id', t => {
+  const s = store(t); s.thread('main');
+  for (const driver of ['unknown', 'pi', 'antigravity', 'constructor']) s.provider(driver, 'main', 'same-id', driver);
+  assert.equal(readT3SessionRelations(['same-id'], { homeDir: s.home, env: {} }).size, 0);
 });

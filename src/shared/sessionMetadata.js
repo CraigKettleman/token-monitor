@@ -17,6 +17,7 @@ const workbuddySession = require('./providers/workbuddy/sessionMetadata');
 const devinSessionMetadata = require('./providers/devin/sessionMetadata');
 const grokSessionMetadata = require('./providers/grok/sessionMetadata');
 const { readT3SessionRelations } = require('./t3SessionMetadata');
+const { supportsT3SessionClient, nativeAccountingId } = require('./t3SessionIdentity');
 
 function isoFromDate(value) {
   const date = value instanceof Date ? value : new Date(value || '');
@@ -350,14 +351,14 @@ function sessionMetadataMap(periods, home = os.homedir(), deps = {}) {
 
 function applyT3SessionParents(periods, home = os.homedir(), deps = {}, targets) {
   const candidates = (session) => {
-    if (session.client !== 'codex') return [session.sessionId];
+    if (session.client !== 'codex') return [nativeAccountingId(session.client, session.sessionId)].filter(Boolean);
     if (session.nativeSessionId) return [session.nativeSessionId];
     // A filename with several UUIDs does not identify its native conversation
     // unambiguously. Keep it ungrouped rather than choosing a filename hint.
     const ids = String(session.sessionId).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
     return new Set(ids.map((id) => id.toLowerCase())).size > 1 ? [] : codexSession.threadIdCandidates(session.sessionId);
   };
-  const supported = (session) => ['codex', 'claude'].includes(session?.client) && session.sessionId;
+  const supported = (session) => supportsT3SessionClient(session?.client) && session.sessionId;
   const allSessions = Object.values(periods || {}).flatMap((period) => Object.values(period?.sessions || {})).filter(supported);
   const children = targets ? allSessions.filter((session) => targets.has(session)) : allSessions;
   const relations = readT3SessionRelations(children.flatMap(candidates), { ...deps, homeDir: home, useEnvRoot: deps.scopedHome !== true });

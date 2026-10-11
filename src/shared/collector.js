@@ -2212,7 +2212,7 @@ function collectorAnchorTrust(saved, options = {}) {
 // valid, so a long-running session periodically rescans month/allTime
 // and picks up any changes that the delta-derivation might miss.
 const FULL_SCAN_INTERVAL_MS = 60 * 60 * 1000;
-const SESSION_IDENTITY_VERSION = 1;
+const SESSION_IDENTITY_VERSION = 2;
 
 // Ceiling on how long an unbroken run of watch events may keep deferring the
 // tick. Every event clears the pending debounce timer and re-arms a fresh one,

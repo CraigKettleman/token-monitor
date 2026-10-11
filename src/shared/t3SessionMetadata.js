@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveSqlite, openDb } = require('./sqliteReadOnly');
+const { nativeAccountingId, readT3IdentityBindings, t3AccountingClient } = require('./t3SessionIdentity');
 
 const QUERY_CHUNK_SIZE = 400;
 const T3_DEFAULT_TITLES = new Set(['new thread', 'start a new conversation']);
@@ -206,8 +207,6 @@ function readT3SessionMeta(sessionIds, deps = {}) {
 // Only app-owned delegation is a parent link. In particular, a human fork is
 // not a subagent, and the parent's currently active provider may have changed
 // since it dispatched the task. The execution root records the launch identity.
-const T3_CLIENTS = { codex: 'codex', claudeAgent: 'claude' };
-const NATIVE_UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
 // App thread identity is independent of provider identity. Resumes, provider
 // switches and accepted run attempts can all belong to the same app thread.
@@ -237,14 +236,21 @@ function readT3SessionRelations(nativeIds, deps = {}) {
       const has = (key, fields) => fields.every(field => columns[key].has(field));
       if (!has('t', ['thread_id', 'deleted_at', 'payload_json'])
         || !has('p', ['provider_thread_id', 'thread_id', 'driver', 'payload_json'])) continue;
+      const bindings = readT3IdentityBindings(file);
+      const instance = alias => {
+        const payloadId = `json_extract(${json(alias)}, '$.providerInstanceId')`;
+        return columns.p.has('provider_instance_id')
+          ? `(CASE WHEN ${payloadId} IS NULL OR ${payloadId} = ${alias}.provider_instance_id THEN ${alias}.provider_instance_id END)`
+          : payloadId;
+      };
       const strong = `${native('p', 'driver')} = p.driver AND ${native('p', 'strength')} = 'strong'`;
       const facts = new Map();
       const add = row => {
-        const client = T3_CLIENTS[row.driver];
-        const id = cleanText(row.nativeId);
+        const client = t3AccountingClient(row.driver, row.instanceId, bindings);
+        const id = nativeAccountingId(client, row.nativeId, row.historical);
         const threadId = cleanText(row.threadId);
-        if (!client || !id || !threadId || (row.historical && !NATIVE_UUID.test(id))) return;
-        const key = `${client}:${NATIVE_UUID.test(id) ? id.toLowerCase() : id}`;
+        if (!client || !id || !threadId) return;
+        const key = `${client}:${id}`;
         if (ambiguous.has(key)) return;
         if (out.has(key) && out.get(key).threadId !== threadId) {
           out.delete(key); facts.delete(key); ambiguous.add(key);
@@ -256,7 +262,7 @@ function readT3SessionRelations(nativeIds, deps = {}) {
       for (let offset = 0; offset < ids.length; offset += QUERY_CHUNK_SIZE) {
         const chunk = ids.slice(offset, offset + QUERY_CHUNK_SIZE);
         const params = chunk.map(() => '?').join(',');
-        const sql = `SELECT p.driver, ${native('p', 'nativeId')} AS nativeId, p.thread_id AS threadId
+        const sql = `SELECT p.driver, ${instance('p')} AS instanceId, ${native('p', 'nativeId')} AS nativeId, p.thread_id AS threadId
           FROM ${names.p} p JOIN ${names.t} t ON t.thread_id = p.thread_id
           WHERE t.deleted_at IS NULL AND ${strong}
             AND ${native('p', 'nativeId')} IN (${params})`;
@@ -268,7 +274,7 @@ function readT3SessionRelations(nativeIds, deps = {}) {
       // Pin join order: SQLite otherwise scans every message/tool node first.
       if (has('a', ['thread_id', 'provider_thread_id', 'root_node_id', 'status', 'payload_json'])
           && has('n', ['node_id', 'thread_id', 'provider_thread_id', 'kind'])) {
-        const history = `SELECT p.driver, 1 AS historical, json_extract(${json('a')}, '$.nativeThreadId') AS nativeId,
+        const history = `SELECT p.driver, 1 AS historical, ${instance('p')} AS instanceId, json_extract(${json('a')}, '$.nativeThreadId') AS nativeId,
             p.thread_id AS threadId FROM ${names.a} a
             CROSS JOIN ${names.p} p ON p.provider_thread_id = a.provider_thread_id AND p.thread_id = a.thread_id
             CROSS JOIN ${names.t} t ON t.thread_id = p.thread_id
@@ -294,7 +300,7 @@ function readT3SessionRelations(nativeIds, deps = {}) {
         // child provider only on completion. The subagent record's explicit
         // child_thread_id binds running work without guessing from a title.
         const sql = `SELECT cp.thread_id AS childThreadId, pp.thread_id AS parentThreadId,
-          pp.driver AS parentDriver, ${native('pp', 'nativeId')} AS parentId
+          pp.driver AS parentDriver, ${instance('pp')} AS parentInstanceId, ${native('pp', 'nativeId')} AS parentId
           FROM ${names.p} cp CROSS JOIN ${names.t} t ON cp.thread_id = t.thread_id
           CROSS JOIN ${names.n} n ON n.node_id = json_extract(${json('t')}, '$.forkedFrom.nodeId')
             AND n.kind = 'subagent'
@@ -317,8 +323,8 @@ function readT3SessionRelations(nativeIds, deps = {}) {
             AND ${native('pp', 'driver')} = pp.driver AND ${native('pp', 'strength')} = 'strong'
             AND cp.thread_id IN (${chunk.map(() => '?').join(',')})`;
         for (const row of db.prepare(sql).all(...chunk)) {
-          const parentClient = T3_CLIENTS[row.parentDriver];
-          const parentNativeId = cleanText(row.parentId);
+          const parentClient = t3AccountingClient(row.parentDriver, row.parentInstanceId, bindings);
+          const parentNativeId = nativeAccountingId(parentClient, row.parentId);
           if (!parentClient || !parentNativeId || row.childThreadId === row.parentThreadId) continue;
           const link = { parentThreadId: row.parentThreadId, parentClient, parentNativeId };
           const previous = links.get(row.childThreadId);

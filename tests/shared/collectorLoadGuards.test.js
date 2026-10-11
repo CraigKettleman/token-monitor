@@ -1926,13 +1926,16 @@ test('Kimi metadata discovery indexes session directories instead of probing eve
       period.sessions[`kimi:missing-${index}`] = { client: 'kimi', sessionId: `missing-${index}`, totalTokens: 1 };
     }
     let statCalls = 0;
+    let t3StoreProbes = 0;
     fs.statSync = (...args) => {
-      statCalls += 1;
+      if (String(args[0]).endsWith(`${path.sep}statev2.sqlite`) || String(args[0]).endsWith(`${path.sep}state.sqlite`)) t3StoreProbes += 1;
+      else statCalls += 1;
       return originalStatSync(...args);
     };
     const { applySessionTimestamps } = freshCollector();
     applySessionTimestamps({ allTime: period }, tmp, { resolveProjects: true });
     assert.equal(statCalls, 0, 'missing ids should not trigger workspace x session state.json probes');
+    assert.ok(t3StoreProbes <= 6, 'T3 discovery stays bounded independently of session count');
   } finally {
     fs.statSync = originalStatSync;
     os.homedir = originalHomedir;

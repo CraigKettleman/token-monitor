@@ -165,7 +165,7 @@ function applyNativeSessionId(target, source) {
 
 const conflictingT3Identities = new WeakSet();
 function applyT3ThreadId(target, source) {
-  const id = ['codex', 'claude'].includes(source.client) && typeof source.t3ThreadId === 'string'
+  const id = typeof source.t3ThreadId === 'string'
     && source.t3ThreadId.length <= 1024 && /^[a-z0-9][a-z0-9:%_.-]*$/i.test(source.t3ThreadId)
     ? source.t3ThreadId : '';
   if (!id || conflictingT3Identities.has(target)) return;
