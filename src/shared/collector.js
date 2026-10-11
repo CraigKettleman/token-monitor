@@ -48,6 +48,8 @@ const { createCursorSelfSync } = require('./providers/cursor/selfSync');
 const { cursorDesktopWatchRoots, isCursorDesktopStateWrite } = require('./providers/cursor/desktopState');
 const {
   applySessionMetadata,
+  applyT3SessionParents,
+  applySessionIdentities,
   applyTokscaleSessionMetadata,
   projectIdentity,
   projectPathFromJsonl,
@@ -694,10 +696,16 @@ function propagateTodayProjects(today, periods, titleMetadata = {}) {
       // link is not simply copied. A link the derived period can still resolve
       // stays; one whose parent has no usage left there (its rollout was
       // deleted, say) yields to the fresh link when that one resolves.
-      if (session.parentSessionId && session.parentSessionId !== target.parentSessionId
-        && (!target.parentSessionId || (!sessionHasPeriodUsage(period, target.client, target.parentSessionId)
-          && sessionHasPeriodUsage(period, target.client, session.parentSessionId)))) {
+      if (session.nativeSessionId) target.nativeSessionId = session.nativeSessionId;
+      if (session.t3ThreadId) target.t3ThreadId = session.t3ThreadId;
+      const parentClient = session.parentClient || session.client;
+      const targetParentClient = target.parentClient || target.client;
+      if (session.parentSessionId && (session.parentSessionId !== target.parentSessionId || parentClient !== targetParentClient)
+        && (!target.parentSessionId || (!sessionHasPeriodUsage(period, targetParentClient, target.parentSessionId)
+          && sessionHasPeriodUsage(period, parentClient, session.parentSessionId)))) {
         target.parentSessionId = session.parentSessionId;
+        if (parentClient !== target.client) target.parentClient = parentClient;
+        else delete target.parentClient;
       }
       // Context occupancy is replaced rather than gap-filled: the derived
       // periods carry the last full scan's reading, which is older than this
@@ -1066,8 +1074,16 @@ async function collectUsageOnce(options) {
       // them again would re-stat every historical session file every few seconds
       // (the perceived UI stutter). Decorate only today, then propagate its freshly
       // resolved identities onto sessions that started today (absent from the anchor).
+      // Upgrade retained identity metadata once, on the usage worker, without
+      // rescanning tokens or moving the frozen delta baseline.
       decorateLocalPeriods({ today }, { retryMisses: true });
+      if (anchor.sessionIdentityVersion !== SESSION_IDENTITY_VERSION) {
+        applySessionIdentities({ month, allTime }, options.homeDir || os.homedir(), localSessionMetadataDeps);
+      }
       propagateTodayProjects(today, { month, allTime }, { ...localSessionMetadataDeps, t3Titles: anchor.t3Titles });
+      // A delegated child may be new today while its idle parent exists only in
+      // the broader anchor. Resolve app links without re-reading transcripts.
+      applyT3SessionParents({ today, month, allTime }, options.homeDir || os.homedir(), localSessionMetadataDeps);
     } else {
       decorateLocalPeriods({ today, month, allTime }, { retryMisses: true });
     }
@@ -1281,6 +1297,7 @@ async function collectUsageOnce(options) {
       }
     }
     options.onAnchorComputed({
+      sessionIdentityVersion: SESSION_IDENTITY_VERSION,
       windowsPeriods,
       todayPartitions,
       t3Titles,
@@ -2195,6 +2212,7 @@ function collectorAnchorTrust(saved, options = {}) {
 // valid, so a long-running session periodically rescans month/allTime
 // and picks up any changes that the delta-derivation might miss.
 const FULL_SCAN_INTERVAL_MS = 60 * 60 * 1000;
+const SESSION_IDENTITY_VERSION = 1;
 
 // Ceiling on how long an unbroken run of watch events may keep deferring the
 // tick. Every event clears the pending debounce timer and re-arms a fresh one,
@@ -2639,6 +2657,7 @@ function startCollector(options) {
       if (trust) {
         anchor = {
           dateKey: saved.dateKey,
+          sessionIdentityVersion: saved.sessionIdentityVersion,
           today: saved.today,
           month: saved.month,
           allTime: saved.allTime,
@@ -2670,6 +2689,7 @@ function startCollector(options) {
       fs.mkdirSync(path.dirname(anchorPath), { recursive: true });
       fs.writeFileSync(anchorPath, JSON.stringify({
         dateKey: anchor.dateKey,
+        sessionIdentityVersion: anchor.sessionIdentityVersion,
         cursorAutoModelVersion: 1,
         today: anchor.today,
         month: anchor.month,
@@ -2908,6 +2928,7 @@ function startCollector(options) {
       if (!anchored && captured) {
         anchor = {
           dateKey: todayKey,
+          sessionIdentityVersion: captured.sessionIdentityVersion,
           today: captured.windowsPeriods.today,
           month: captured.windowsPeriods.month,
           allTime: captured.windowsPeriods.allTime,
@@ -2924,6 +2945,18 @@ function startCollector(options) {
         lastFullScanAt = Date.now();
         persistAnchor(tickPricingRevision);
       } else if (anchored && captured) {
+        const identitiesUpgraded = anchor.sessionIdentityVersion !== captured.sessionIdentityVersion;
+        if (identitiesUpgraded) {
+          for (const period of ['today', 'month', 'allTime']) {
+            for (const [key, session] of Object.entries(anchor[period]?.sessions || {})) {
+              const resolved = captured.windowsPeriods[period]?.sessions?.[key];
+              for (const field of ['nativeSessionId', 't3ThreadId']) {
+                if (resolved?.[field]) session[field] = resolved[field];
+              }
+            }
+          }
+          anchor.sessionIdentityVersion = captured.sessionIdentityVersion;
+        }
         // Keep the rolling per-client today partitions fresh for targeted
         // watch ticks. WSL stays independently frozen between interval ticks.
         if (captured.todayPartitions) anchor.todayPartitions = captured.todayPartitions;
@@ -2972,7 +3005,7 @@ function startCollector(options) {
           wslAnchor = captured.wslBundle;
           wslStatusAnchor = captured.wslStatus || null;
         }
-        if (titlesChanged || projectsChanged || sourcesChanged) persistAnchor(tickPricingRevision);
+        if (titlesChanged || projectsChanged || sourcesChanged || identitiesUpgraded) persistAnchor(tickPricingRevision);
       }
       const transformedSummary = await onUpdate?.(summary, reason);
       publishedCodexVisibilityRevision = visibilityRevision;

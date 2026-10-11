@@ -841,3 +841,73 @@ test('flat catalog project provenance requires a full scan instead of guessing p
   assert.equal(collectorAnchorTrust(anchor, options), null);
   assert.ok(collectorAnchorTrust({ ...anchor, catalogProjects: { today: { 'antigravity:session': 'project-a' }, month: {}, allTime: {} } }, options));
 });
+
+test('old persisted anchors upgrade conversation identities once without changing the frozen usage baseline', async t => {
+  const { DatabaseSync } = require('node:sqlite');
+  const { normalizePeriod } = require('../../src/shared/usage');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-identity-anchor-'));
+  const previousDir = process.env.TOKEN_MONITOR_SHARED_DIR;
+  process.env.TOKEN_MONITOR_SHARED_DIR = home;
+  let handle;
+  t.after(() => {
+    handle?.stop();
+    if (previousDir === undefined) delete process.env.TOKEN_MONITOR_SHARED_DIR;
+    else process.env.TOKEN_MONITOR_SHARED_DIR = previousDir;
+    delete require.cache[collectorPath];
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const native = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const historyDir = path.join(home, '.codex', 'sessions');
+  fs.mkdirSync(historyDir, { recursive: true });
+  fs.writeFileSync(path.join(historyDir, 'historical.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: native } }) + '\n');
+  const dbPath = path.join(home, 't3.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, deleted_at TEXT, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, driver TEXT, payload_json TEXT);`);
+  db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('app-thread', '{}');
+  db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('provider', 'app-thread', 'codex',
+    JSON.stringify({ nativeThreadRef: { nativeId: native, driver: 'codex', strength: 'strong' } }));
+  db.close();
+  const period = (history = false) => normalizePeriod({ totalTokens: history ? 40 : 10, costUsd: history ? 4 : 1,
+    sessions: { 'codex:today': { client: 'codex', sessionId: 'today', totalTokens: 10, costUsd: 1 },
+      ...(history ? { 'codex:historical': { client: 'codex', sessionId: 'historical', totalTokens: 30, costUsd: 3 } } : {}) } });
+  const file = path.join(home, 'collector-anchor.json');
+  const capturedAt = new Date().toISOString();
+  fs.writeFileSync(file, JSON.stringify({ dateKey: localTodayKey(), today: period(), month: period(true), allTime: period(true),
+    configFingerprint: configFingerprint('codex', '2024-01-01', false), fullScanAt: capturedAt }));
+  const scans = [], resolved = [], updates = [];
+  const options = { ...baseOptions, clients: 'codex', homeDir: home, projectsEnabled: false,
+    intervalMs: 3600000, watchEnabled: false, wslScanEnabled: false, sessionActivityPolling: false,
+    runTokscale: async ({ flags }) => {
+      scans.push(flags);
+      return { entries: [{ client: 'codex', sessionId: 'today', model: 'gpt-test', input: 20, output: 0, cost: 2 }] };
+    },
+    sessionMetadataDeps: { env: {}, t3DbPaths: [dbPath], sessionMetadataResolvers: new Map([['codex', ids => {
+      resolved.push(...ids);
+      return new Map([...ids].map(id => [id, { nativeSessionId: native }]));
+    }]]) },
+    onUpdate: summary => updates.push(summary) };
+  handle = freshCollector().startCollector(options);
+  await waitForCondition(() => updates.length === 1);
+  await handle.whenIdle();
+  assert.equal(scans.length, 1, 'migration uses the ordinary today scan, never new historical token scans');
+  assert.equal(resolved.includes('historical'), false, 'migration only reads identity headers, never full historical metadata');
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.sessionIdentityVersion, 1);
+  assert.equal(saved.fullScanAt, capturedAt, 'metadata migration does not pretend to be a new full scan');
+  assert.equal(saved.today.totalTokens, 10, 'frozen delta baseline is retained');
+  assert.equal(saved.month.totalTokens, 40);
+  assert.equal(saved.month.sessions['codex:historical'].nativeSessionId, native);
+  assert.equal(saved.month.sessions['codex:historical'].t3ThreadId, 'app-thread');
+  assert.equal(updates[0].month.totalTokens, 50, 'today delta is applied exactly once');
+  assert.equal(updates[0].month.costUsd, 5);
+  handle.stop();
+  handle = null;
+  resolved.length = 0;
+  handle = freshCollector().startCollector(options);
+  await waitForCondition(() => updates.length === 2);
+  assert.equal(scans.length, 2, 'warm restart still scans only today');
+  assert.equal(resolved.includes('historical'), false, 'upgraded anchors do not reread historical transcripts each tick');
+  assert.equal(updates[1].month.totalTokens, 50, 'warm restart never reapplies an already counted delta');
+  assert.equal(updates[1].month.sessions['codex:historical'].t3ThreadId, 'app-thread');
+});

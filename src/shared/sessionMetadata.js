@@ -16,6 +16,7 @@ const dshSessionMetadata = require('./providers/dsh/sessionMetadata');
 const workbuddySession = require('./providers/workbuddy/sessionMetadata');
 const devinSessionMetadata = require('./providers/devin/sessionMetadata');
 const grokSessionMetadata = require('./providers/grok/sessionMetadata');
+const { readT3SessionRelations } = require('./t3SessionMetadata');
 
 function isoFromDate(value) {
   const date = value instanceof Date ? value : new Date(value || '');
@@ -347,6 +348,76 @@ function sessionMetadataMap(periods, home = os.homedir(), deps = {}) {
   return metadata;
 }
 
+function applyT3SessionParents(periods, home = os.homedir(), deps = {}, targets) {
+  const candidates = (session) => {
+    if (session.client !== 'codex') return [session.sessionId];
+    if (session.nativeSessionId) return [session.nativeSessionId];
+    // A filename with several UUIDs does not identify its native conversation
+    // unambiguously. Keep it ungrouped rather than choosing a filename hint.
+    const ids = String(session.sessionId).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
+    return new Set(ids.map((id) => id.toLowerCase())).size > 1 ? [] : codexSession.threadIdCandidates(session.sessionId);
+  };
+  const supported = (session) => ['codex', 'claude'].includes(session?.client) && session.sessionId;
+  const allSessions = Object.values(periods || {}).flatMap((period) => Object.values(period?.sessions || {})).filter(supported);
+  const children = targets ? allSessions.filter((session) => targets.has(session)) : allSessions;
+  const relations = readT3SessionRelations(children.flatMap(candidates), { ...deps, homeDir: home, useEnvRoot: deps.scopedHome !== true });
+  if (!relations.size) return;
+  for (const session of children) {
+    const matches = candidates(session).map(id => relations.get(`${session.client}:${id}`)).filter(Boolean);
+    if (matches.length && matches.every(fact => fact.threadId === matches[0].threadId)) session.t3ThreadId = matches[0].threadId;
+  }
+  const index = (sessions) => {
+    const out = new Map();
+    // Native Codex identities may have several rollouts. Select the first
+    // accounting member available in this period, rather than changing keys.
+    const ordered = sessions.filter(supported).sort((a, b) =>
+      String(a.startedAt || a.sessionId).localeCompare(String(b.startedAt || b.sessionId)) || a.sessionId.localeCompare(b.sessionId));
+    for (const session of ordered) {
+      for (const id of candidates(session)) {
+        const key = `${session.client}:${id}`;
+        if (!out.has(key)) out.set(key, session);
+      }
+    }
+    return out;
+  };
+  const fallback = index(allSessions);
+  const appIndex = sessions => new Map(sessions.filter(session => session.t3ThreadId)
+    .map(session => [session.t3ThreadId, session]));
+  const fallbackApps = appIndex(allSessions);
+  for (const period of Object.values(periods || {})) {
+    const sessions = Object.values(period?.sessions || {});
+    const local = index(sessions);
+    const localApps = appIndex(sessions);
+    for (const session of sessions.filter(supported)) {
+      if (targets && !targets.has(session)) continue;
+      // Native links, including Codex reviews, take precedence over app links.
+      if (session.parentSessionId) continue;
+      const matches = candidates(session).map((id) => relations.get(`${session.client}:${id}`)).filter(Boolean);
+      const link = matches[0];
+      if (!link?.parentThreadId || matches.some(other => other.parentThreadId !== link.parentThreadId)) continue;
+      const key = `${link.parentClient}:${link.parentNativeId}`;
+      const parent = local.get(key) || localApps.get(link.parentThreadId) || fallback.get(key) || fallbackApps.get(link.parentThreadId);
+      if (!parent || (parent.client === session.client && parent.sessionId === session.sessionId)) continue;
+      session.parentSessionId = parent.sessionId;
+      if (parent.client !== session.client) session.parentClient = parent.client;
+    }
+  }
+}
+
+// Upgrade only identities in a retained anchor. Historical titles, projects,
+// timestamps and live context must not be refreshed by this one-time pass.
+function applySessionIdentities(periods, home, deps = {}) {
+  const sessions = Object.values(periods || {}).flatMap(period => Object.values(period?.sessions || {}));
+  const codexRows = sessions.filter(session => session.client === 'codex' && !session.nativeSessionId);
+  const ids = new Set(codexRows.map(session => session.sessionId));
+  const nativeIds = codexSession.resolveSessionIdentities(ids, { home, deps });
+  for (const session of codexRows) {
+    const nativeId = nativeIds.get(session.sessionId);
+    if (nativeId) session.nativeSessionId = nativeId;
+  }
+  applyT3SessionParents(periods, home, deps);
+}
+
 function applySessionMetadata(periods, home, deps = {}) {
   const metadata = sessionMetadataMap(periods, home, deps);
   for (const [periodName, period] of Object.entries(periods || {})) {
@@ -369,6 +440,7 @@ function applySessionMetadata(periods, home, deps = {}) {
         meta.titleFallback = session.title;
       }
       if (meta.title) session.title = meta.title;
+      if (session.client === 'codex' && meta.nativeSessionId) session.nativeSessionId = meta.nativeSessionId;
       // A catalog title is not evidence about transcript state or activity.
       if (meta.titleOnly === true) continue;
       if (meta.catalogOnly === true) {
@@ -431,10 +503,13 @@ function applySessionMetadata(periods, home, deps = {}) {
       }
     }
   }
+  applyT3SessionParents(periods, home, deps);
 }
 
 module.exports = {
   applySessionMetadata,
+  applyT3SessionParents,
+  applySessionIdentities,
   applyTokscaleSessionMetadata,
   // Compatibility aliases for existing callers; metadata now includes titles,
   // projects, and session kind in addition to timestamps.

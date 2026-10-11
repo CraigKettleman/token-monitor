@@ -203,4 +203,148 @@ function readT3SessionMeta(sessionIds, deps = {}) {
   return out;
 }
 
-module.exports = { expandHomePath, t3HomeDir, discoverT3DbPaths, readT3SessionMeta };
+// Only app-owned delegation is a parent link. In particular, a human fork is
+// not a subagent, and the parent's currently active provider may have changed
+// since it dispatched the task. The execution root records the launch identity.
+const T3_CLIENTS = { codex: 'codex', claudeAgent: 'claude' };
+const NATIVE_UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+
+// App thread identity is independent of provider identity. Resumes, provider
+// switches and accepted run attempts can all belong to the same app thread.
+function readT3SessionRelations(nativeIds, deps = {}) {
+  const ids = [...new Set(Array.from(nativeIds || []).map(String).filter(Boolean))];
+  const out = new Map();
+  const ambiguous = new Set();
+  const ambiguousParents = new Set();
+  const sqlite = resolveSqlite(deps);
+  if (!ids.length || !sqlite) return out;
+  const names = {
+    t: 'orchestration_v2_projection_threads',
+    p: 'orchestration_v2_projection_provider_threads',
+    n: 'orchestration_v2_projection_nodes',
+    a: 'orchestration_v2_projection_run_attempts',
+    s: 'orchestration_v2_projection_subagents'
+  };
+  const json = alias => `CASE WHEN json_valid(${alias}.payload_json) THEN ${alias}.payload_json ELSE '{}' END`;
+  const native = (alias, field) => `json_extract(${json(alias)}, '$.nativeThreadRef.${field}')`;
+  for (const file of discoverT3DbPaths(deps)) {
+    let db;
+    try {
+      if (!fs.statSync(file).isFile()) continue;
+      db = openDb(file, sqlite);
+      const columns = Object.fromEntries(Object.entries(names).map(([key, name]) =>
+        [key, new Set(db.prepare(`PRAGMA table_info(${name})`).all().map(row => row.name))]));
+      const has = (key, fields) => fields.every(field => columns[key].has(field));
+      if (!has('t', ['thread_id', 'deleted_at', 'payload_json'])
+        || !has('p', ['provider_thread_id', 'thread_id', 'driver', 'payload_json'])) continue;
+      const strong = `${native('p', 'driver')} = p.driver AND ${native('p', 'strength')} = 'strong'`;
+      const facts = new Map();
+      const add = row => {
+        const client = T3_CLIENTS[row.driver];
+        const id = cleanText(row.nativeId);
+        const threadId = cleanText(row.threadId);
+        if (!client || !id || !threadId || (row.historical && !NATIVE_UUID.test(id))) return;
+        const key = `${client}:${NATIVE_UUID.test(id) ? id.toLowerCase() : id}`;
+        if (ambiguous.has(key)) return;
+        if (out.has(key) && out.get(key).threadId !== threadId) {
+          out.delete(key); facts.delete(key); ambiguous.add(key);
+        } else {
+          const fact = out.get(key) || { threadId };
+          out.set(key, fact); facts.set(key, fact);
+        }
+      };
+      for (let offset = 0; offset < ids.length; offset += QUERY_CHUNK_SIZE) {
+        const chunk = ids.slice(offset, offset + QUERY_CHUNK_SIZE);
+        const params = chunk.map(() => '?').join(',');
+        const sql = `SELECT p.driver, ${native('p', 'nativeId')} AS nativeId, p.thread_id AS threadId
+          FROM ${names.p} p JOIN ${names.t} t ON t.thread_id = p.thread_id
+          WHERE t.deleted_at IS NULL AND ${strong}
+            AND ${native('p', 'nativeId')} IN (${params})`;
+        for (const row of db.prepare(sql).all(...chunk)) add(row);
+      }
+      // T3 stamps nativeThreadId after a provider turn starts. It is retained
+      // when a resume failure replaces nativeThreadRef on the provider row.
+      // Validate the attempt's provider and root ownership before using it.
+      // Pin join order: SQLite otherwise scans every message/tool node first.
+      if (has('a', ['thread_id', 'provider_thread_id', 'root_node_id', 'status', 'payload_json'])
+          && has('n', ['node_id', 'thread_id', 'provider_thread_id', 'kind'])) {
+        const history = `SELECT p.driver, 1 AS historical, json_extract(${json('a')}, '$.nativeThreadId') AS nativeId,
+            p.thread_id AS threadId FROM ${names.a} a
+            CROSS JOIN ${names.p} p ON p.provider_thread_id = a.provider_thread_id AND p.thread_id = a.thread_id
+            CROSS JOIN ${names.t} t ON t.thread_id = p.thread_id
+            CROSS JOIN ${names.n} root ON root.node_id = a.root_node_id
+              AND root.thread_id = a.thread_id AND root.provider_thread_id = a.provider_thread_id
+              AND root.kind = 'root_turn'
+            WHERE t.deleted_at IS NULL AND ${strong}
+              AND a.status IN ('running', 'completed', 'failed', 'interrupted', 'cancelled')
+              AND json_extract(${json('a')}, '$.nativeThreadId') IN (SELECT value FROM json_each(?))`;
+        for (const row of db.prepare(history).all(JSON.stringify(ids))) add(row);
+      }
+      if (!has('n', ['node_id', 'thread_id', 'root_node_id', 'kind', 'provider_thread_id'])) continue;
+      const threads = [...new Set([...facts.values()].map(fact => fact.threadId))];
+      const links = new Map();
+      const conflictingThreads = new Set();
+      const hasTasks = has('s', ['subagent_id', 'thread_id', 'child_thread_id', 'origin']);
+      for (let offset = 0; offset < threads.length; offset += QUERY_CHUNK_SIZE) {
+        const chunk = threads.slice(offset, offset + QUERY_CHUNK_SIZE);
+        // The referenced delegation node is a primary-key lookup, not a scan
+        // of tool/messages. Its launching root proves the parent. A child's
+        // later provider threads still belong to that same child app thread.
+        // App-owned nodes start with provider_thread_id=NULL and receive the
+        // child provider only on completion. The subagent record's explicit
+        // child_thread_id binds running work without guessing from a title.
+        const sql = `SELECT cp.thread_id AS childThreadId, pp.thread_id AS parentThreadId,
+          pp.driver AS parentDriver, ${native('pp', 'nativeId')} AS parentId
+          FROM ${names.p} cp CROSS JOIN ${names.t} t ON cp.thread_id = t.thread_id
+          CROSS JOIN ${names.n} n ON n.node_id = json_extract(${json('t')}, '$.forkedFrom.nodeId')
+            AND n.kind = 'subagent'
+            AND n.thread_id = json_extract(${json('t')}, '$.lineage.parentThreadId')
+          LEFT JOIN ${names.p} initial ON initial.provider_thread_id = n.provider_thread_id
+            AND initial.thread_id = cp.thread_id
+          ${hasTasks ? `LEFT JOIN ${names.s} task ON task.subagent_id = n.node_id` : ''}
+          JOIN ${names.n} root ON root.node_id = n.root_node_id
+            AND root.kind = 'root_turn' AND root.thread_id = n.thread_id
+          JOIN ${names.p} pp ON pp.provider_thread_id = root.provider_thread_id AND pp.thread_id = n.thread_id
+          JOIN ${names.t} parent ON parent.thread_id = pp.thread_id
+          WHERE t.deleted_at IS NULL AND parent.deleted_at IS NULL
+            ${hasTasks ? `AND (task.subagent_id IS NULL OR (task.thread_id = n.thread_id AND task.child_thread_id = cp.thread_id))
+            AND (initial.provider_thread_id IS NOT NULL OR (n.provider_thread_id IS NULL
+              AND task.origin = 'app_owned' AND task.child_thread_id = cp.thread_id))`
+    : 'AND initial.provider_thread_id IS NOT NULL'}
+            AND json_extract(${json('t')}, '$.lineage.relationshipToParent') = 'subagent'
+            AND json_extract(${json('t')}, '$.forkedFrom.type') = 'node'
+            AND ${native('cp', 'driver')} = cp.driver AND ${native('cp', 'strength')} = 'strong'
+            AND ${native('pp', 'driver')} = pp.driver AND ${native('pp', 'strength')} = 'strong'
+            AND cp.thread_id IN (${chunk.map(() => '?').join(',')})`;
+        for (const row of db.prepare(sql).all(...chunk)) {
+          const parentClient = T3_CLIENTS[row.parentDriver];
+          const parentNativeId = cleanText(row.parentId);
+          if (!parentClient || !parentNativeId || row.childThreadId === row.parentThreadId) continue;
+          const link = { parentThreadId: row.parentThreadId, parentClient, parentNativeId };
+          const previous = links.get(row.childThreadId);
+          if (previous && JSON.stringify(previous) !== JSON.stringify(link)) conflictingThreads.add(row.childThreadId);
+          else links.set(row.childThreadId, link);
+        }
+      }
+      for (const [key, fact] of facts) {
+        const link = links.get(fact.threadId);
+        if (conflictingThreads.has(fact.threadId) || (link && fact.parentThreadId
+          && fact.parentThreadId !== link.parentThreadId)) {
+          for (const field of ['parentThreadId', 'parentClient', 'parentNativeId']) delete fact[field];
+          ambiguousParents.add(key);
+        } else if (link && !ambiguousParents.has(key)) Object.assign(fact, link);
+      }
+    } catch (_) { /* missing, locked, malformed, or older stores supply no facts */ } finally {
+      if (db) { try { db.close(); } catch (_) {} }
+    }
+  }
+  return out;
+}
+
+function readT3SessionParents(nativeIds, deps = {}) {
+  return new Map([...readT3SessionRelations(nativeIds, deps)]
+    .filter(([, fact]) => fact.parentClient && fact.parentNativeId)
+    .map(([key, fact]) => [key, { parentClient: fact.parentClient, parentNativeId: fact.parentNativeId }]));
+}
+
+module.exports = { expandHomePath, t3HomeDir, discoverT3DbPaths, readT3SessionMeta, readT3SessionParents, readT3SessionRelations };

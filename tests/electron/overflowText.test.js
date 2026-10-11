@@ -207,13 +207,13 @@ for (const phase of ['pending', 'active', 'completed']) {
     // A detached replacement has no text geometry until commitCard mounts it.
     const content = replacement.children[0];
     content.getBoundingClientRect = () => ({ width: replacement.isConnected ? 300 : 0 });
-    const previousList = { scrollTop: 37 };
-    const nextList = { scrollTop: 0 };
+    const previousList = { scrollTop: 37, closest: () => null };
+    const nextList = { scrollTop: 0, closest: () => null };
     function card(title, list) {
       return {
         dataset: { cellId: 'sessions', breakdownMode: 'session' },
         querySelector: () => list,
-        querySelectorAll: selector => selector === '.fade-overflow'
+        querySelectorAll: selector => selector === '.scroll' ? [list] : selector === '.fade-overflow'
           || (selector === '.fade-overflow.is-hover-reading' && title.classList.contains('is-hover-reading'))
           ? [title] : []
       };
@@ -236,6 +236,7 @@ for (const phase of ['pending', 'active', 'completed']) {
     const end = dock.indexOf('\n}', start) + 2;
     assert.ok(start >= 0 && end > start, 'commitCard source boundaries exist');
     const context = {
+      document: h.document,
       contentLayer, overflowText: h.api, CARD_SCROLL_SELECTOR: '.scroll',
       cardResetAnimator: { capture: () => null, animate() {} }
     };
