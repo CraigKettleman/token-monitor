@@ -894,6 +894,11 @@ function electronLimitsDeps() {
         json: () => result.json()
       };
     },
+    // Every account the app-owned credential can read as, so the WorkBuddy row
+    // can be one row per account rather than one row for whichever account
+    // happened to be active. The enumerator is the same reader the transport
+    // uses, so its answer and the accounts that can authenticate never drift.
+    workbuddySessions: () => electronWorkbuddyLocalAuth.sessions(),
     resolveConfigSnapshot: () => electronLimitsConfig(),
     onClaudeWebCookieRenewed: persistClaudeWebCookieRenewal,
     onAntigravityCredentialsRenewed: persistAntigravityCredentialsRenewal,

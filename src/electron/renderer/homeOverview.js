@@ -114,6 +114,10 @@
               planStatus: window.planStatus || '',
               showMeter: window.showMeter !== false,
               detail: window.detail || '',
+              // A credits window states a balance by default. The provider that
+              // collapsed several accounts into this one marked it as having a
+              // real denominator, and Home states that as a percentage.
+              ...(window.preferPercent === true ? { preferPercent: true } : {}),
               index: windowIndex
             };
           })

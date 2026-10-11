@@ -635,7 +635,12 @@ function providerCollapseKey(provider) {
       // identical on every platform. Two keys mean two accounts, and collapsing
       // by provider name alone would let one device's row silently replace the
       // other's.
-      || provider.provider === 'alibaba')
+      || provider.provider === 'alibaba'
+      // WorkBuddy's accountKey is the signed-in account UID, so it too is the
+      // same on every platform and one row per account is the intended shape.
+      // Two keys are two accounts; collapsing by provider name would fold them
+      // into one row and hide every account but the last one read.
+      || provider.provider === 'workbuddy')
     && isConfiguredProvider(provider)
   ) {
     return providerAggregateKey(provider);

@@ -328,6 +328,25 @@ state.toolPreferenceSourceSignature = '';
 state.customScanPathErrors = new Map();
 state.limitProviderRenderSignature = '';
 state.limitPanelRenderSignature = '';
+// Folded account groups, by provider id. UI state only: it is not a setting, so
+// it never reaches settings.json, the Hub, or another device, and a restart
+// starts folded again. WorkBuddy is the one provider that opens folded, because
+// its header states the combined balance and the accounts are the detail.
+const limitGroupExpandedIds = new Set();
+const LIMIT_GROUP_FOLDED_BY_DEFAULT = new Set(['workbuddy']);
+
+function isLimitGroupExpanded(providerId) {
+  const id = String(providerId || '').trim().toLowerCase();
+  return limitGroupExpandedIds.has(id) || !LIMIT_GROUP_FOLDED_BY_DEFAULT.has(id);
+}
+
+function toggleLimitGroup(providerId) {
+  const id = String(providerId || '').trim().toLowerCase();
+  if (!id) return false;
+  if (isLimitGroupExpanded(id)) limitGroupExpandedIds.delete(id);
+  else limitGroupExpandedIds.add(id);
+  return isLimitGroupExpanded(id);
+}
 state.settingsPushRevision = 0;
 state.limitProviderSelectionRevision = 0;
 state.pendingLimitProviderSelection = null;
@@ -4161,7 +4180,12 @@ const limitWindowsView = window.TokenMonitorLimitWindowsView.createLimitWindowsV
   subscriptions: () => state.settings?.subscriptions,
   subscriptionAccounts: () => limitProvidersForSubscriptions(),
   monthClientCosts: () => state.stats?.periods?.month?.clientCosts,
-  resetForecast: () => ({ busy: state.codexResetForecastBusy, forecast: state.codexResetForecast })
+  resetForecast: () => ({ busy: state.codexResetForecastBusy, forecast: state.codexResetForecast }),
+  // WorkBuddy reports one balance per account, so its group opens folded onto the
+  // combined figure the header carries. The page is the only surface that folds:
+  // the dock card draws the same rows at a glance and has no room to hide half
+  // of them behind a click.
+  limitGroupFold: (providerId) => ({ expanded: isLimitGroupExpanded(providerId) })
 });
 
 const {
@@ -4185,7 +4209,11 @@ function optionalFiniteNumber(value) {
 function formatHomeLimitWindowValue(window, showUsed) {
   if (window?.planStatus === 'expired') return t('limits.mimo.planExpired');
   if (String(window?.detail || '').toLowerCase() === 'unlimited') return t('settings.thirdparty.unlimited');
-  if (isCreditsWindow(window)) {
+  // A credits window normally states its balance, because that is the only thing
+  // a top-up has to state. A window that carries a real cycle denominator can
+  // state a percentage instead, and the row that asked for one gets it — this is
+  // how a collapsed multi-account row reads like a single-account row.
+  if (isCreditsWindow(window) && window.preferPercent !== true) {
     if (window.remaining == null) {
       return String(window.detail || '').toLowerCase() === 'unlimited'
         ? t('settings.thirdparty.unlimited')
@@ -4469,6 +4497,39 @@ function renderLimits() {
   }
   els.limitsPanel.replaceChildren(...nodes);
   animateLimitResets(resetMotionSnapshot);
+}
+
+// The folded WorkBuddy group, opened and closed by its own header. Delegated from
+// the panel rather than bound per header, because renderLimits() rebuilds every
+// row on a stats push and a listener on a replaced node would go with it.
+function limitGroupIdFromEvent(event) {
+  const head = event.target?.closest?.('.limit-head-foldable');
+  const row = head?.closest?.('.limit-row-group');
+  if (!row) return '';
+  return String(row.dataset.limitGroupProvider || '').trim().toLowerCase();
+}
+
+function handleLimitGroupToggle(event) {
+  const id = limitGroupIdFromEvent(event);
+  if (!id) return false;
+  const expanded = toggleLimitGroup(id);
+  const row = event.target.closest('.limit-row-group');
+  row.classList.toggle('expanded', expanded);
+  row.querySelector('.limit-head-foldable')?.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  return true;
+}
+
+if (els.limitsPanel) {
+  els.limitsPanel.addEventListener('click', (event) => {
+    if (event.target.closest('button, a, input, select, textarea')) return;
+    handleLimitGroupToggle(event);
+  });
+  els.limitsPanel.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    if (!event.target.closest?.('.limit-head-foldable')) return;
+    event.preventDefault();
+    handleLimitGroupToggle(event);
+  });
 }
 
 function serviceStatusLabel(status) {
@@ -5766,13 +5827,13 @@ function homeLimitRows() {
   return homeOverviewApi.homeLimitAccountsForProviders({
     // Hidden rows go before the compact pick, so Antigravity's tightest window
     // per group is chosen among the ones the user still shows.
-    providers: (state.stats?.limits?.providers || []).map((provider) => ({
+    providers: limitWindowsView.collapseWorkbuddyAccounts((state.stats?.limits?.providers || []).map((provider) => ({
       ...provider,
       windows: limitProviderPresentationApi.limitProviderCompactWindows(
         provider,
         (provider.windows || []).filter((window) => !isWindowHidden(provider.provider, window))
       )
-    })),
+    }))),
     providerOptions,
     enabledProviderIds: Array.from(enabled),
     hiddenProviderIds: Array.from(hiddenHomeLimitProviderSet()),

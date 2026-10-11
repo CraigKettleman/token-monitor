@@ -1694,3 +1694,236 @@ test('with every item unchecked, Home and the picker keep no window the card dre
   }
   assert.deepEqual(problems, []);
 });
+
+// WorkBuddy answers once per signed-in account, and the page draws them as one
+// group. These pin the three things that make the group readable: the header
+// states the combined balance so it stands for the accounts under it, each
+// account keeps its own name, and only the page folds the group away.
+
+function workbuddyAccount(userId, name, remaining, limit) {
+  return {
+    provider: 'workbuddy',
+    status: 'ok',
+    accountKey: `sha256:${userId}`,
+    accountName: name,
+    accountLabel: 'Personal',
+    windows: [{
+      kind: 'billing',
+      metric: 'credits',
+      label: 'Credits',
+      currency: 'CREDITS',
+      used: limit - remaining,
+      limit,
+      remaining,
+      usedPercent: ((limit - remaining) / limit) * 100,
+      resetsAt: null,
+      showMeter: true
+    }],
+    balance: { amount: remaining, currency: 'CREDITS' }
+  };
+}
+
+test('a WorkBuddy group states the combined balance before any account is opened', () => {
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+  const group = dockView().renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  const detail = group.find('limit-detail');
+
+  // The figure the header carries has to be every account summed — 95 of 150 —
+  // or the row reading it would be wrong the moment a second account signs in.
+  assert.equal(detail.textContent, '95/150');
+  assert.match(group.text, /63% left/);
+  // The count sits beside the title while the combined balance sits under the
+  // bar, so a folded group still says how many accounts it is standing for.
+  assert.match(group.text, /2 accounts/);
+});
+
+test('each WorkBuddy account keeps its own name, plan word and balance', () => {
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+  const group = dockView().renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  const list = group.find('limit-account-list');
+  const rows = [...list.walk()].filter((node) => node.classNames.has('limit-account-row'));
+
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.find('limit-name-title').textContent), ['Account A', 'Account B']);
+  // "Personal" is the same for every account, so repeating it on each row says
+  // nothing; the nickname is the only thing that tells two personal accounts
+  // apart, and it is what the row is titled by.
+  assert.deepEqual(rows.map((row) => row.find('limit-plan').textContent), ['', '']);
+  assert.deepEqual(
+    rows.map((row) => row.find('limit-detail').textContent),
+    ['70/100', '25/50']
+  );
+});
+
+test('only the page folds a WorkBuddy group, and only it starts closed', () => {
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+  const page = dockView({}, { limitGroupFold: () => ({ expanded: false }) })
+    .renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  assert.equal(page.classNames.has('has-fold'), true);
+  assert.equal(page.classNames.has('expanded'), false);
+  assert.equal(page.find('limit-head-foldable').attributes['aria-expanded'], 'false');
+
+  // The dock card draws the same rows at a glance and has no room to hide half of
+  // them behind a click, so it never supplies the state and every group stays
+  // open there. The markup is the same; only the collapsed default differs.
+  const card = dockView().renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  assert.equal(card.classNames.has('expanded'), true);
+  assert.ok(card.find('limit-row-accordion-inner').text.includes('Account B'));
+});
+
+test('a WorkBuddy group whose accounts cannot be summed stays open and unlabelled', () => {
+  // No account answered with a denominator, so there is no combined figure and a
+  // header stating one would be inventing it.
+  const accounts = [
+    { ...workbuddyAccount('user-a', 'Account A', 70, 100), status: 'unavailable', windows: [], balance: null },
+    { ...workbuddyAccount('user-b', 'Account B', 25, 50), status: 'unavailable', windows: [], balance: null }
+  ];
+  const group = dockView({}, { limitGroupFold: () => ({ expanded: false }) })
+    .renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+
+  assert.equal(group.classNames.has('has-fold'), false);
+  assert.equal(group.find('limit-window-text'), null);
+});
+
+test('a WorkBuddy account row reads like a single-account Qoder row', () => {
+  const [row] = [
+    workbuddyAccount('user-a', 'Account A', 70, 100)
+  ].map((account) => dockView().renderProviderWindows(account, '#12B7F5'));
+
+  // Percentage leading and count under the bar is what Qoder draws, and two
+  // providers reporting remaining-of-a-cycle should not read differently.
+  assert.match(row.text, /70% left/);
+  assert.equal(row.find('limit-detail').textContent, '70/100');
+});
+
+test('Home collapses WorkBuddy accounts into one row like a single-account provider', () => {
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+  const view = dockView();
+  const [row] = view.collapseWorkbuddyAccounts(accounts);
+
+  // Home draws one row per provider, so the two accounts become the one row the
+  // page and the dock both read from — the same sum the group header states.
+  assert.equal(row.windows.length, 1);
+  assert.equal(row.windows[0].remaining, 95);
+  assert.equal(row.windows[0].limit, 150);
+  assert.match(view.renderProviderWindows(row, '#12B7F5').text, /63% left/);
+  assert.match(view.renderProviderWindows(row, '#12B7F5').text, /95\/150/);
+});
+
+test('WorkBuddy accounts that cannot be summed stay separate rows on Home', () => {
+  const view = dockView();
+  const accounts = [
+    { ...workbuddyAccount('user-a', 'Account A', 70, 100), status: 'unavailable', windows: [], balance: null },
+    { ...workbuddyAccount('user-b', 'Account B', 25, 50), status: 'unavailable', windows: [], balance: null }
+  ];
+
+  // A row stating a total it cannot compute would be worse than two honest rows.
+  assert.equal(view.collapseWorkbuddyAccounts(accounts).length, 2);
+});
+
+test('Home never collapses a single WorkBuddy account', () => {
+  const view = dockView();
+  const accounts = [workbuddyAccount('user-a', 'Account A', 70, 100)];
+  const collapsed = view.collapseWorkbuddyAccounts(accounts);
+
+  assert.equal(collapsed.length, 1);
+  assert.equal(collapsed[0], accounts[0]);
+});
+
+test('Home collapses WorkBuddy in place and leaves every other provider alone', () => {
+  const view = dockView();
+  const qoder = { provider: 'qoder', status: 'ok', accountKey: 'q1', windows: [{
+    kind: 'billing', metric: 'credits', label: 'Credits', remaining: 1344, limit: 1800,
+    used: 456, usedPercent: 25.33, showMeter: true
+  }], balance: { amount: 1344, currency: 'CREDITS' } };
+  const openrouter = [
+    { provider: 'openrouter', status: 'ok', accountKey: 'k1', accountName: 'Work', windows: [] },
+    { provider: 'openrouter', status: 'ok', accountKey: 'k2', accountName: 'Personal', windows: [] }
+  ];
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    qoder,
+    ...openrouter,
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+
+  const collapsed = view.collapseWorkbuddyAccounts(accounts);
+
+  // Two WorkBuddy accounts become one row; everything else survives, in place.
+  // Rewriting the whole list instead would hand one provider's numbers to
+  // another provider's row.
+  assert.deepEqual(collapsed.map((provider) => provider.provider), [
+    'workbuddy', 'qoder', 'openrouter', 'openrouter'
+  ]);
+  assert.equal(collapsed[0].windows[0].remaining, 95);
+  assert.equal(collapsed[1], qoder);
+  assert.deepEqual(collapsed.slice(2), openrouter);
+});
+
+test('Home states the collapsed WorkBuddy total as a percentage, not a balance', () => {
+  const app = fs.readFileSync(path.join(root, 'src/electron/renderer/app.js'), 'utf8');
+  const start = app.indexOf('function homeLimitRows()');
+  const end = app.indexOf('function homeLimitWindowLabel(', start);
+  const formatStart = app.indexOf('function formatHomeLimitWindowValue');
+  const formatEnd = app.indexOf('\nfunction providersByLimitProviderId(', formatStart);
+  const settings = { homeLimitProviderOrder: ['workbuddy'], homeLimitAccountCount: 5 };
+  const providers = [
+    { ...workbuddyAccount('user-a', 'Account A', 70, 100), accountName: 'Account A' },
+    { ...workbuddyAccount('user-b', 'Account B', 25, 50), accountName: 'Account B' }
+  ];
+  const view = dockView(settings);
+  const context = {
+    state: { stats: { limits: { providers } }, settings },
+    enabledLimitProviderSet: () => new Set(['workbuddy']),
+    hiddenHomeLimitProviderSet: () => new Set(),
+    LIMIT_PROVIDERS: [{ id: 'workbuddy', label: 'WorkBuddy' }],
+    limitProviderOrderApi: require('../../src/electron/renderer/limits/providerOrder'),
+    limitUsageItemsApi: require('../../src/shared/limits/usageItems'),
+    homeOverviewApi: require('../../src/electron/renderer/homeOverview'),
+    limitProviderPresentationApi: limitPresentationApi,
+    limitWindowsView: view,
+    limitAccountTitle: view.limitAccountTitle,
+    ...limitWindowLabels,
+    clientColors: {}
+  };
+  const rows = vm.runInNewContext(`${app.slice(start, end)}; homeLimitRows();`, context);
+
+  // One row for the provider, carrying the summed window.
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].windows.length, 1);
+  // Home keeps the derived percentage and the remaining amount, not the
+  // denominator: the row it draws never states one.
+  assert.equal(rows[0].windows[0].remaining, 95);
+  assert.ok(Math.abs(rows[0].windows[0].remainingPercent - (95 / 150) * 100) < 1e-9);
+
+  // And Home renders it the way Qoder's row reads: a percentage, with the count
+  // left to the Limits page. A top-up balance has no denominator and keeps
+  // stating its amount, which is what `preferPercent` distinguishes.
+  const formatValue = vm.runInNewContext(`${app.slice(formatStart, formatEnd)}; formatHomeLimitWindowValue;`, {
+    state: { settings: {} },
+    isCreditsWindow: balanceDisplay.isCreditsWindow,
+    formatCompactMoney: (value) => String(value),
+    limitFillPercent: limitDisplayMode.limitFillPercent,
+    formatPercent: (percent) => `${Math.round(percent)}%`,
+    limitModeSuffix: (showUsed) => (showUsed ? 'used' : 'left'),
+    t: (key) => key,
+    currentLocale: () => 'zh'
+  });
+  assert.equal(formatValue(rows[0].windows[0], false), '63% left');
+  assert.equal(
+    formatValue({ kind: 'billing', metric: 'credits', label: 'Credits', remaining: 120.5, showMeter: true }, false),
+    '120.5'
+  );
+});

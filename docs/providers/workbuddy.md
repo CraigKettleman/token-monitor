@@ -70,9 +70,44 @@ That distinction is the whole point: an encrypted credential is not a signed-out
 | `absent`, `incomplete`, `malformed` | `notConfigured` | "Sign in" |
 | `expired` | `unauthorized` | "Sign in again" |
 
+The encrypted row appears only when no account could be read at all. When the fallback source below supplies accounts, they are reported normally and the app file's read reason never reaches the renderer.
+
 `expired` is the one state where the read and the request disagree, and it is worth knowing why: `getSessionInfo()` hides an expired session, so the enabled local lane proceeds to a request, and `request()` re-reads the same file and rejects it as `unauthorized`. That rejection is what produces the "Sign in again" prompt.
 
 `normalizeStoredSession()` stays the session-or-null accessor for callers that only want a session; `inspectStoredSession()` returns the `{ session, reason }` pair. Both live in the Electron layer, so the shared limits module receives the reason as plain configuration rather than reaching back into the reader.
+
+### Multiple accounts
+
+Sealing the credential is not the only reason the app file is insufficient: it also describes **one** account — whichever was active — while a user can be signed in to several. The reader therefore resolves accounts from two sources, in this order:
+
+1. **The app's own file.** This is the authority. It needs no third-party tool, and it is what the app itself wrote.
+2. **`~/.wb-switch/accounts.json`**, written by the third-party [`workbuddy-switch`](https://github.com/changexbc/workbuddy-switch) tool. It is read only when the app file yields no usable session, and its entries are already plaintext.
+
+The fallback is a **read of a file the user's own tooling produced**. Token Monitor does not decrypt anything here, does not hold a key, and does not write to that file; it also never asks the user to install anything. An install without `workbuddy-switch` behaves exactly as it did before this existed. `WORKBUDDY_SWITCH_ACCOUNTS_FILE` and `readSwitchSessions()` are the whole surface.
+
+Rules that keep the fallback honest:
+
+- **The app file is tried first, every time.** A readable, unexpired app session ends the resolution; the fallback is not consulted, so a machine that never sealed its credential sees one row.
+- **An injected `authDirectory` disables the fallback.** A caller that supplies its own auth directory supplies the whole environment, so a test never reads the machine's real `~/.wb-switch`.
+- **Expired fallback entries are skipped**, not repaired, and a uid appearing twice is kept once: either mistake would publish a wrong balance.
+- **A partial entry is dropped.** An entry without both `access_token` and `uid` cannot authenticate, so it is skipped rather than guessed at.
+
+Each resolved account becomes its own limits row on the Limits page. `accountName` is the switch nickname, falling back to the uid, because two personal accounts are otherwise identical on screen. `providerCollapseKey()` in the shared limits module lists `workbuddy` alongside `claude`, `codex`, `alibaba` and the rest, which is what keeps the aggregate from folding the rows into one; its `accountKey` is the account uid, so it is stable across platforms.
+
+### How the two surfaces divide the accounts
+
+The Limits page and Home answer different questions, so they present the accounts differently and share the arithmetic that makes them agree.
+
+**The Limits page unfolds them.** The group header states the combined balance — every account's `remaining` and `limit` summed — and the accounts sit under it behind a fold. `workbuddyCombinedWindow()` is that sum, and it is what the header's percentage and meter are computed from, so the header and the rows under it can never disagree. WorkBuddy opens folded; the dock card supplies no fold state and so keeps drawing every row.
+
+**Home states one row per provider.** Home's own grouping is one row per provider record, and WorkBuddy answers once per account, so `collapseWorkbuddyAccounts()` rewrites the WorkBuddy entries into one before Home groups them. It rewrites only those entries and leaves every other provider in place; a version that replaced the whole array handed one provider's numbers to another provider's row.
+
+Two details that are easy to get wrong:
+
+- **The collapsed window carries `preferPercent: true`.** A credits window normally states its balance, because a top-up has no denominator and an amount is all it can state. WorkBuddy's accounts each report a real cycle denominator, so the collapsed row has one too and states a percentage — the way Qoder's row already reads. The marker is explicit rather than inferred from the window's shape, and `homeOverview.js` passes it through when it copies a window onto a Home row.
+- **A sum that cannot be computed is not published.** Fewer than two accounts, or none reporting a denominator, and the entries are returned unchanged: two honest rows are better than one row stating a total it cannot compute.
+
+**This is the only provider that resolves several accounts this way.** Every other multi-account provider reads its own credential store or settings. Applying the same fallback to another provider means repeating this section for it, not generalising the reader.
 
 ## Request contract
 
@@ -84,9 +119,11 @@ That distinction is the whole point: an encrypted credential is not a signed-out
 | --- | --- |
 | Transcript metadata and roots | `src/shared/providers/workbuddy/sessionMetadata.js`, shared CodeBuddy transcript readers |
 | Transcript discovery and streaming Detail | `src/shared/sessionFiles.js`, `src/shared/sessionDetail.js`, `src/shared/sessionDetailResolver.js` |
-| App session reading, encryption detection, read reasons | `src/electron/providers/workbuddy/localAuth.js` |
+| App session reading, encryption detection, read reasons, account resolution | `src/electron/providers/workbuddy/localAuth.js` |
 | Billing request and response mapping | `src/shared/providers/workbuddy/limits.js` |
 | Widget lane configuration and reason plumbing | `src/electron/main.js`, `src/electron/runtimeConfig.js` |
+| Multi-account grouping and per-account fold | `src/electron/renderer/limits/windowsView.js`, `src/electron/renderer/app.js` |
+| Home's one row per provider | `src/electron/renderer/homeOverview.js` |
 | Action hint bounds | `src/shared/limits/core.js`, generated `worker/src/shared/limits/core.js` |
 | Status label and localized strings | `src/electron/renderer/limits/providerPresentation.js`, `src/electron/renderer/i18n.js` |
 | Wire contract | `docs/API.md` |
@@ -98,6 +135,12 @@ That distinction is the whole point: an encrypted credential is not a signed-out
 - personal and enterprise billing mapping, including the unlimited enterprise plan;
 - an empty active-package list staying visible as configured;
 - a sealed credential reporting `encrypted` rather than a missing sign-in;
+- the app file winning over the switch fallback, and the fallback answering only
+  when the app file is sealed or absent;
+- one limits row per resolved account, and a per-account refresh asking only for
+  the account it names;
+- the collapsed Home row summing the accounts, and a sum it cannot compute
+  leaving the accounts as separate rows;
 - the read reasons for absent, malformed, oversized, incomplete and expired sessions;
 - the widget lane refusing a legacy `.env` or settings token;
 - an explicit token outranking the local session;

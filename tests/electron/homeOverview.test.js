@@ -385,6 +385,12 @@ for (const { name, settings, expected } of [
       DEFAULT_LIMIT_PROVIDER_ORDER: 'claude',
       limitProviderOrderApi,
       homeOverviewApi: { homeLimitAccountsForProviders, homeLimitsAwaitingFirstData },
+      // Home collapses WorkBuddy's accounts before grouping them. These cases
+      // have no providers at all, so the real implementation is used rather than
+      // a stub that would pass whatever shape the test happened to hand it.
+      limitWindowsView: require('../../src/electron/renderer/limits/windowsView').createLimitWindowsView({
+        presentation: require('../../src/electron/renderer/limits/providerPresentation')
+      }),
       clientColors: {},
       hiddenHomeLimitProviderSet: () => new Set(),
       homeModuleShell: () => ({ module: {}, body }),

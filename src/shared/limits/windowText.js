@@ -161,6 +161,12 @@
 
     if (id === 'qoder') return billing ? result(null, rawCount(window, showUsed)) : EMPTY;
 
+    // WorkBuddy reports a cycle total behind the remaining figure, and the row
+    // reads exactly like Qoder's: the percentage leads, the count sits under the
+    // bar. Trae shares the credits window without a denominator, so it keeps the
+    // money branch below.
+    if (id === 'workbuddy') return billing ? result(null, rawCount(window, showUsed)) : EMPTY;
+
     if (id === 'zed') {
       if (!billing) return EMPTY;
       if (window.limitId === 'zed.edit-predictions') return result(null, rawCount(window, showUsed));

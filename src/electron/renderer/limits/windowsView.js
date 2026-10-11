@@ -44,6 +44,12 @@
   if (node) module.exports = api;
   if (root) root.TokenMonitorLimitWindowsView = api;
 })(typeof window !== 'undefined' ? window : globalThis, function createLimitWindowsViewApi(limitProviders, usageItems) {
+  // Fully-open groups, and the same margin the account list carries outside a
+  // fold, so a host that never folds renders exactly what it rendered before.
+  function DEFAULT_LIMIT_GROUP_FOLD() {
+    return { expanded: true };
+  }
+
   function createLimitWindowsView(deps) {
     const {
       t,
@@ -78,6 +84,10 @@
       limitWindowLabel,
       limitWindowText,
       mimoAccountGroups,
+      // A host that folds an account group supplies its current state; one that
+      // does not leaves every group open, which is how the dock card keeps
+      // rendering the same rows as the page.
+      limitGroupFold = DEFAULT_LIMIT_GROUP_FOLD,
       mimoProductLabel,
       accountIdentity,
       accountControl,
@@ -788,6 +798,89 @@
       : '';
   }
 
+  // The header of a folded WorkBuddy group stands for every account below it, so
+  // it reports their combined balance as one window — the same shape and the same
+  // row Qoder draws, with the percentage leading and the count under the bar.
+  // Only the credits window is summed: it is the one window the provider reports,
+  // and a row that never answered contributes nothing rather than zeroing the
+  // total.
+  function workbuddyCombinedWindow(providers) {
+    let remaining = 0;
+    let limit = 0;
+    let used = 0;
+    let counted = 0;
+    let currency = '';
+    let label = '';
+    for (const provider of providers || []) {
+      const window = (provider?.windows || []).find((entry) => entry?.metric === 'credits')
+        || (provider?.windows || [])[0];
+      const accountRemaining = optionalFiniteNumber(window?.remaining);
+      const accountLimit = optionalFiniteNumber(window?.limit);
+      if (accountRemaining === null || accountLimit === null || accountLimit <= 0) continue;
+      remaining += accountRemaining;
+      limit += accountLimit;
+      used += optionalFiniteNumber(window?.used) ?? Math.max(0, accountLimit - accountRemaining);
+      currency = currency || window?.currency || provider?.balance?.currency || '';
+      label = label || window?.label || 'Credits';
+      counted += 1;
+    }
+    if (counted === 0 || limit <= 0) return null;
+    return {
+      kind: 'billing',
+      metric: 'credits',
+      label,
+      currency,
+      remaining,
+      limit,
+      used,
+      usedPercent: (used / limit) * 100,
+      remainingPercent: Math.max(0, Math.min(100, (remaining / limit) * 100)),
+      showMeter: true
+    };
+  }
+
+  // Home draws one row per provider, and WorkBuddy answers once per account. The
+  // row it draws is therefore the combined one: the accounts summed into a single
+  // Credits window, so Home reads exactly like a single-account provider's row.
+  // The accounts themselves are still there — they are what the Limits page
+  // unfolds.
+  //
+  // Returns the accounts unchanged when they cannot be summed (one account, or
+  // none that reported a denominator), because a row stating a total it cannot
+  // compute would be worse than two honest rows.
+  function collapseWorkbuddyAccounts(providers) {
+    const entries = Array.isArray(providers) ? providers.filter(Boolean) : [];
+    const accounts = entries.filter((provider) => provider.provider === 'workbuddy');
+    if (accounts.length < 2) return entries;
+    const combined = workbuddyCombinedWindow(accounts);
+    if (!combined) return entries;
+    // The first account's record carries the identity, so every field the row
+    // reads beyond the window — colour, status, freshness — keeps describing a
+    // real account rather than a fabricated one.
+    const [first] = accounts;
+    const merged = {
+      ...first,
+      // Every account reports a real cycle denominator, so the combined row has
+      // one too, and Home states it as a percentage the way Qoder's row does.
+      // The marker is explicit rather than inferred from the window shape: a
+      // top-up balance is also a credits window, and it has no denominator to
+      // turn into a percentage.
+      windows: [{ ...combined, preferPercent: true }],
+      balance: { amount: combined.remaining, currency: combined.currency },
+      groupAccounts: accounts
+    };
+    // Every other provider keeps its place: this only rewrites the WorkBuddy
+    // entries, and it puts the merged row where the first of them was rather
+    // than moving it to the front of the list.
+    let placed = false;
+    return entries.flatMap((provider) => {
+      if (provider.provider !== 'workbuddy') return [provider];
+      if (placed) return [];
+      placed = true;
+      return [merged];
+    });
+  }
+
   function clineCreditsNode(provider, credits, spend) {
     const value = creditsBalanceValue(provider, credits);
     if (!value) return null;
@@ -1418,7 +1511,25 @@
         node.classList.add('limit-window-wide');
         windows.append(node);
       }
-    } else if (provider.provider === 'workbuddy' || provider.provider === 'trae') {
+    } else if (provider.provider === 'workbuddy') {
+      // The same row Qoder draws: the percentage leads and the count sits under
+      // the bar, so two providers that both report remaining-of-a-cycle read the
+      // same way. `windowText` owns the count; the window supplies the percent.
+      windows.classList.add('limit-windows-workbuddy');
+      const credits = windowForKind(provider, 'billing');
+      if (credits) {
+        const node = limitWindowNode(
+          credits?.label || 'Credits',
+          credits,
+          color,
+          0.68,
+          null,
+          providerWindowText(provider, credits).detail
+        );
+        node.classList.add('limit-window-wide');
+        windows.append(node);
+      }
+    } else if (provider.provider === 'trae') {
       const credits = windowForKind(provider, 'billing');
       const balance = provider.balance || null;
       const value = creditsBalanceValue(provider, credits);
@@ -1759,6 +1870,15 @@
   function renderLimitProviderHead(id, label, provider, color, options = {}) {
     const head = document.createElement('div');
     head.className = 'limit-head';
+    // A foldable header is the whole control for the accounts under it, so it
+    // states its own state and takes the keyboard the way every other toggle in
+    // the panel does.
+    if (options.foldable) {
+      head.classList.add('limit-head-foldable');
+      head.setAttribute('role', 'button');
+      head.setAttribute('tabindex', '0');
+      head.setAttribute('aria-expanded', options.expanded ? 'true' : 'false');
+    }
     const titleBlock = document.createElement('div');
     titleBlock.className = 'limit-title';
     const name = document.createElement('div');
@@ -2137,6 +2257,17 @@
     antigravity: (provider, color, { grouped }) => ({
       options: grouped ? { showIcon: false } : {}
     }),
+    // One row per signed-in account under a header that already wears the mark
+    // and states the combined balance, so a row is only the account's own name
+    // and figure. The plan cell stays empty for the same reason the OpenRouter
+    // rows blank it: every WorkBuddy account reports "Personal", which would
+    // repeat down the group without telling the rows apart.
+    workbuddy: (provider, color, { grouped }) => ({
+      options: {
+        ...(grouped ? { showIcon: false } : {}),
+        ...((provider?.status === 'ok' || provider?.stale) ? { planText: '' } : {})
+      }
+    }),
     thirdparty: (provider, color, { grouped, sharedFamily }) => {
       const visual = presentationApi.thirdPartyAdapterVisual(provider, color);
       // One mark per adapter, not one per group. With several adapters in the
@@ -2163,7 +2294,16 @@
     },
     // A Codex group's forecast describes the account set, not one account, so it
     // is appended once below the rows instead of on each of them.
-    codex: () => ({ forecastOnGroup: true })
+    codex: () => ({ forecastOnGroup: true }),
+    // Every WorkBuddy account reports the same Credits window, so the header can
+    // state the whole before an account is opened, and the accounts fold away
+    // underneath it. A group whose windows cannot be summed — no account
+    // answered with a denominator — falls back to the plain count and stays open.
+    workbuddy: (providers) => {
+      const combined = workbuddyCombinedWindow(providers);
+      if (!combined) return {};
+      return { headerWindow: combined, foldable: true };
+    }
   };
 
   function limitAccountRowPolicy(id, provider, color, context) {
@@ -2302,9 +2442,12 @@
     return text === key ? '' : text;
   }
 
-  function renderLimitProviderGroupFrame(providerId, label, providers, color, { count, markId } = {}) {
+  function renderLimitProviderGroupFrame(providerId, label, providers, color, { count, markId, fold, headerWindow } = {}) {
     const row = document.createElement('div');
     row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
+    // The fold handler reads the provider off the row it was clicked in, since
+    // renderLimits() rebuilds these nodes and the handler is delegated.
+    row.dataset.limitGroupProvider = providerId;
     // The header stands for the rows it draws, including when a card hides
     // another row of this provider. Subscription rollups use that exact set.
     const groupProvider = {
@@ -2314,13 +2457,53 @@
       accountGroup: true,
       groupAccounts: providers
     };
-    row.append(renderLimitProviderHead(providerId, label, groupProvider, color, {
+    const head = renderLimitProviderHead(providerId, label, groupProvider, color, {
+      // The account count sits beside the title while the combined balance sits
+      // under the bar, so the header says both how much is left in total and how
+      // many accounts that total covers. Without the count a folded group gives
+      // no sign that opening it reveals more than one row.
       planText: count ? limitGroupCountText(providerId, count) : '',
       hideMeta: true,
-      ...(markId ? { markId } : {})
-    }));
+      ...(markId ? { markId } : {}),
+      ...(fold ? { foldable: true, expanded: fold.expanded } : {})
+    });
+    row.append(head);
+    // The combined window is drawn with the same builder an account row uses, so
+    // the header reads as one provider — percentage leading, count under the bar
+    // — and only the figure behind it is the sum.
+    if (headerWindow) {
+      const windows = document.createElement('div');
+      windows.className = 'limit-windows';
+      const node = limitWindowNode(
+        headerWindow.label || 'Credits',
+        headerWindow,
+        color,
+        0.95,
+        null,
+        providerWindowText(groupProvider, headerWindow).detail
+      );
+      node.classList.add('limit-window-wide');
+      windows.append(node);
+      row.append(windows);
+    }
     const list = document.createElement('div');
     list.className = 'limit-account-list';
+    if (fold) {
+      // The same fold the breakdown rows use: the header toggles `expanded`, and
+      // the CSS animates `grid-template-rows` from 0fr to 1fr, so no height has
+      // to be measured. The header is the only control — the accounts under it
+      // are not separately focusable, so the fold costs no extra tab stop.
+      const accordion = document.createElement('div');
+      accordion.className = 'limit-row-accordion';
+      const inner = document.createElement('div');
+      inner.className = 'limit-row-accordion-inner';
+      inner.append(list);
+      accordion.append(inner);
+      row.classList.add('has-fold');
+      if (fold.expanded) row.classList.add('expanded');
+      row.append(accordion);
+      return { row, list, groupProvider, head };
+    }
     row.append(list);
     return { row, list, groupProvider };
   }
@@ -2377,9 +2560,15 @@
   function renderLimitProviderGroup(providerId, label, providers, color) {
     if (providerId === 'mimo') return renderMimoProviderGroup(label, providers, color);
     const policy = LIMIT_GROUP_POLICIES[providerId] || (() => ({}));
-    const { markId, sharedFamily, forecastOnGroup } = policy(providers);
+    const { markId, sharedFamily, forecastOnGroup, headerWindow, foldable } = policy(providers);
+    const fold = foldable ? limitGroupFold(providerId) : null;
     const { row, list: accountList } = renderLimitProviderGroupFrame(
-      providerId, label, providers, color, { count: providers.length, markId }
+      providerId, label, providers, color, {
+        count: providers.length,
+        markId,
+        headerWindow,
+        fold
+      }
     );
     providers.forEach((provider, index) => {
       const account = limitAccountRowPolicy(providerId, provider, color, { grouped: true, sharedFamily });
@@ -2754,6 +2943,10 @@
     antigravityQuotaGroups,
     attachLimitDetailTooltip,
     setDetailTooltip,
+    // Home draws one row per provider, so it needs the same account collapse the
+    // limits group header uses — exported rather than reimplemented, because the
+    // two only agree while they are the same sum.
+    collapseWorkbuddyAccounts,
     codexResetForecastExpired,
     limitAccountTitle,
     limitAccountPlan,
