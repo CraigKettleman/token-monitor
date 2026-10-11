@@ -481,7 +481,9 @@ test('a token and cost update through updateRow keeps the hovered title moving',
 });
 
 
-test('actual shared row rendering keeps group availability and binds Auto Review model labels with trailing time', () => {
+test('actual shared row rendering keeps group availability and binds Auto Review model labels with trailing time', t => {
+  // Row construction and the adapter's default date formatter share one local day.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 11, 12, 0).getTime() });
   const h = harness(0);
   const rowsApi = require('../../src/electron/renderer/sessionRows');
   const app = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
@@ -521,9 +523,9 @@ test('actual shared row rendering keeps group availability and binds Auto Review
   const update = app.slice(app.indexOf('function updateRow('), app.indexOf('function applyHomeListMark('));
   const member = app.slice(app.indexOf('function sessionGroupRunNode('), app.indexOf('function renderSessionGroupDetail('));
   vm.runInNewContext(`${update}\n${member}\nglobalThis.update = updateRow; globalThis.member = sessionGroupRunNode;`, context);
-  const now = new Date(2026, 9, 11, 8, 1);
+  const now = new Date();
   const accounting = { client: 'codex', sessionId: 'old', t3ThreadId: 'main', totalTokens: 500, costUsd: 2,
-    models: { a: 500 }, lastUsedAt: new Date(now.getTime() - 60000).toISOString() };
+    models: { a: 500 }, lastUsedAt: new Date(2026, 9, 11, 8, 0).toISOString() };
   const native = { client: 'claude', sessionId: 'new', t3ThreadId: 'main', tokenDataUnavailable: true,
     totalTokens: 0, lastUsedAt: now.toISOString(), native: true };
   const [group] = rowsApi.groupSessionRows(rowsApi.sessionRowsForPeriod({ sessions: { old: accounting } }, {
