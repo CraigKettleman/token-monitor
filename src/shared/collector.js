@@ -1083,7 +1083,11 @@ async function collectUsageOnce(options) {
       propagateTodayProjects(today, { month, allTime }, { ...localSessionMetadataDeps, t3Titles: anchor.t3Titles });
       // A delegated child may be new today while its idle parent exists only in
       // the broader anchor. Resolve app links without re-reading transcripts.
-      applyT3SessionParents({ today, month, allTime }, options.homeDir || os.homedir(), localSessionMetadataDeps);
+      const targets = new Set();
+      for (const key of Object.keys(today.sessions || {})) {
+        for (const period of [today, month, allTime]) if (period.sessions?.[key]) targets.add(period.sessions[key]);
+      }
+      applyT3SessionParents({ today, month, allTime }, options.homeDir || os.homedir(), localSessionMetadataDeps, targets);
     } else {
       decorateLocalPeriods({ today, month, allTime }, { retryMisses: true });
     }

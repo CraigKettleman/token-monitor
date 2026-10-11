@@ -84,5 +84,3 @@ Run the Codex session, limits, login and account-switching tests when changing t
 ```bash
 node --test tests/shared/codex*.test.js tests/shared/limitCollector.codex*.test.js tests/shared/sessionContext.test.js tests/electron/codex*.test.js
 ```
-
-T3 App-thread identity is separate from the native session and accounting keys. The shared relationship reader publishes `t3ThreadId` for verified provider runs and accepted historical attempts, allowing Sessions, Home and Edge Dock to keep one conversation across Codex/Claude switches or native-thread replacement. Explicit app-owned delegation remains the only T3 parent relation; human forks stay distinct. See [session relationships](../architecture.md#session-relationships) for ownership checks, conflict handling and persisted-anchor upgrades.

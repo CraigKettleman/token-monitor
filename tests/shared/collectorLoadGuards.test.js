@@ -501,7 +501,8 @@ test('Antigravity summary watches follow homeDir without replacing the process h
 
 for (const source of ['native', 'override', 'configured-home', 'injected-env', 'metadata-env', 'env-precedence', 'cli-home']) {
   test(`Antigravity ${source} summary WAL events refresh titles with an exact today delta`, async (t) => {
-    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    // Keep both 11-second advances on one local day, even at midnight.
+    t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 11, 12, 0).getTime() });
     let sqlite;
     try { sqlite = require('node:sqlite'); } catch (_) { t.skip('node:sqlite unavailable'); return; }
     const sourceRoot = path.join('.gemini', 'antigravity');

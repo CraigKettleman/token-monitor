@@ -1956,6 +1956,14 @@ function deltaValue(base, fresh, anchor, key) {
         childKey
       );
     }
+    // A parent ID and its client namespace are one relationship fact. Keep
+    // the base pair intact; the collector's fresh-link gate decides whether
+    // to replace it. Field-wise fallback can invent a cross-provider parent.
+    if (sample.client && sample.sessionId) {
+      delete result.parentSessionId;
+      delete result.parentClient;
+      applyParentLink(result, base?.parentSessionId ? base : fresh || {});
+    }
     return result;
   }
   return base ?? fresh;

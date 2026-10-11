@@ -45,9 +45,7 @@ async function refreshSessionActivity(summary, providers, options, shared, {
     const originals = new Map();
     const nativeSessions = {};
     const accounting = next.periods || next;
-    const periods = Object.fromEntries(['today', 'month', 'allTime']
-      .filter(name => accounting[name])
-      .map(name => [name, { sessions: accounting[name].sessions }]));
+    const periods = {};
     for (const [name, rows] of Object.entries(next.nativeSessions)) {
       nativeSessions[name] = Object.fromEntries(Object.entries(rows || {}).map(([key, row]) => {
         const copy = { ...row };
@@ -55,16 +53,13 @@ async function refreshSessionActivity(summary, providers, options, shared, {
         originals.set(copy, row);
         return [key, copy];
       }));
-      // This map is metadata lookup only. Keep the target copies visible even
-      // when an archived accounting row has the same key; retain broader
-      // accounting periods so an idle parent can still prove the relation.
-      periods[name] = { sessions: { ...accounting[name]?.sessions, ...nativeSessions[name] } };
+      periods[name] = { sessions: nativeSessions[name] };
     }
     const { applyT3SessionParents } = require('./sessionMetadata');
     applyT3SessionParents(periods, shared.homeDir, {
       ...options.sessionMetadataDeps,
       env: shared.env || options.env || options.sessionMetadataDeps?.env
-    }, targets);
+    }, targets, accounting);
     if ([...targets].some((row) => row.parentSessionId !== originals.get(row).parentSessionId
       || row.parentClient !== originals.get(row).parentClient
       || row.t3ThreadId !== originals.get(row).t3ThreadId)) next = { ...next, nativeSessions };

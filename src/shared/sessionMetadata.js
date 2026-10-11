@@ -349,58 +349,77 @@ function sessionMetadataMap(periods, home = os.homedir(), deps = {}) {
   return metadata;
 }
 
-function applyT3SessionParents(periods, home = os.homedir(), deps = {}, targets) {
+function applyT3SessionParents(periods, home = os.homedir(), deps = {}, targets, evidencePeriods = periods) {
   const candidates = (session) => {
     if (session.client !== 'codex') return [nativeAccountingId(session.client, session.sessionId)].filter(Boolean);
     if (session.nativeSessionId) return [session.nativeSessionId];
-    // A filename with several UUIDs does not identify its native conversation
-    // unambiguously. Keep it ungrouped rather than choosing a filename hint.
+    // A filename with several UUIDs is ambiguous without a verified header.
     const ids = String(session.sessionId).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
     return new Set(ids.map((id) => id.toLowerCase())).size > 1 ? [] : codexSession.threadIdCandidates(session.sessionId);
   };
   const supported = (session) => supportsT3SessionClient(session?.client) && session.sessionId;
-  const allSessions = Object.values(periods || {}).flatMap((period) => Object.values(period?.sessions || {})).filter(supported);
-  const children = targets ? allSessions.filter((session) => targets.has(session)) : allSessions;
-  const relations = readT3SessionRelations(children.flatMap(candidates), { ...deps, homeDir: home, useEnvRoot: deps.scopedHome !== true });
-  if (!relations.size) return;
-  for (const session of children) {
-    const matches = candidates(session).map(id => relations.get(`${session.client}:${id}`)).filter(Boolean);
-    if (matches.length && matches.every(fact => fact.threadId === matches[0].threadId)) session.t3ThreadId = matches[0].threadId;
+  function* sessions(period) {
+    for (const key in period?.sessions || {}) yield period.sessions[key];
   }
-  const index = (sessions) => {
-    const out = new Map();
-    // Native Codex identities may have several rollouts. Select the first
-    // accounting member available in this period, rather than changing keys.
-    const ordered = sessions.filter(supported).sort((a, b) =>
-      String(a.startedAt || a.sessionId).localeCompare(String(b.startedAt || b.sessionId)) || a.sessionId.localeCompare(b.sessionId));
-    for (const session of ordered) {
+  const children = targets ? [...targets].filter(supported)
+    : Object.values(periods || {}).flatMap(period => [...sessions(period)]).filter(supported);
+  if (!children.length) return;
+  const ids = new Map(children.map(session => [session, candidates(session)]));
+  const nativeIds = [...new Set([...ids.values()].flat())];
+  if (!nativeIds.length) return;
+  const relations = readT3SessionRelations(nativeIds, { ...deps, homeDir: home, useEnvRoot: deps.scopedHome !== true });
+  if (!relations.size) return;
+  const links = new Map();
+  for (const session of children) {
+    const matches = ids.get(session).map(id => relations.get(`${session.client}:${id}`)).filter(Boolean);
+    const link = matches[0];
+    if (link && matches.every(fact => fact.threadId === link.threadId)) session.t3ThreadId = link.threadId;
+    // Native links, including Codex reviews, take precedence over app links.
+    if (!session.parentSessionId && link?.parentThreadId
+      && matches.every(fact => fact.parentThreadId === link.parentThreadId)) links.set(session, link);
+  }
+  if (!links.size) return;
+  // History is parent evidence, never an additional lookup target on a watch
+  // tick. Build only the requested parent indexes, and only when a link needs
+  // resolution. Native-only refreshes share accounting maps rather than copy.
+  const parentKeys = new Set([...links.values()].map(link => `${link.parentClient}:${link.parentNativeId}`));
+  const parentThreads = new Set([...links.values()].map(link => link.parentThreadId));
+  const parentClients = new Set([...links.values()].map(link => link.parentClient));
+  const index = (sources) => {
+    const native = new Map();
+    const app = new Map();
+    for (const period of new Set(sources)) for (const session of sessions(period)) {
+      if (!supported(session)) continue;
+      if (parentThreads.has(session.t3ThreadId)) app.set(session.t3ThreadId, session);
+      if (!parentClients.has(session.client)) continue;
       for (const id of candidates(session)) {
         const key = `${session.client}:${id}`;
-        if (!out.has(key)) out.set(key, session);
+        if (!parentKeys.has(key)) continue;
+        const previous = native.get(key);
+        if (!previous || String(session.startedAt || session.sessionId).localeCompare(String(previous.startedAt || previous.sessionId)) < 0
+          || (String(session.startedAt || session.sessionId) === String(previous.startedAt || previous.sessionId)
+            && session.sessionId.localeCompare(previous.sessionId) < 0)) native.set(key, session);
       }
     }
-    return out;
+    return { native, app };
   };
-  const fallback = index(allSessions);
-  const appIndex = sessions => new Map(sessions.filter(session => session.t3ThreadId)
-    .map(session => [session.t3ThreadId, session]));
-  const fallbackApps = appIndex(allSessions);
-  for (const period of Object.values(periods || {})) {
-    const sessions = Object.values(period?.sessions || {});
-    const local = index(sessions);
-    const localApps = appIndex(sessions);
-    for (const session of sessions.filter(supported)) {
-      if (targets && !targets.has(session)) continue;
-      // Native links, including Codex reviews, take precedence over app links.
-      if (session.parentSessionId) continue;
-      const matches = candidates(session).map((id) => relations.get(`${session.client}:${id}`)).filter(Boolean);
-      const link = matches[0];
-      if (!link?.parentThreadId || matches.some(other => other.parentThreadId !== link.parentThreadId)) continue;
+  let fallback;
+  for (const [name, period] of Object.entries(periods || {})) {
+    let local;
+    for (const session of sessions(period)) {
+      const link = links.get(session);
+      if (!link) continue;
+      local ||= index([evidencePeriods?.[name], period]);
       const key = `${link.parentClient}:${link.parentNativeId}`;
-      const parent = local.get(key) || localApps.get(link.parentThreadId) || fallback.get(key) || fallbackApps.get(link.parentThreadId);
+      let parent = local.native.get(key) || local.app.get(link.parentThreadId);
+      if (!parent) {
+        fallback ||= index([...Object.values(evidencePeriods || {}), ...Object.values(periods || {})]);
+        parent = fallback.native.get(key) || fallback.app.get(link.parentThreadId);
+      }
       if (!parent || (parent.client === session.client && parent.sessionId === session.sessionId)) continue;
       session.parentSessionId = parent.sessionId;
       if (parent.client !== session.client) session.parentClient = parent.client;
+      else delete session.parentClient;
     }
   }
 }

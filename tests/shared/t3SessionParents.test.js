@@ -453,6 +453,8 @@ test('accepted run identities survive native replacement; pending or wrongly own
 
 for (const client of ['claude', 'devin']) test(`T3 ${client} identities survive wire, real SQLite archive and title removal while cross-device conflicts fail closed`, t => {
   const { createSessionUsageArchiveStore } = require('../../src/shared/usage/sessionUsageArchiveStore');
+  let reopened;
+  t.after(() => reopened?.close());
   const s = store(t); const make = t3ThreadId => normalizePeriod({ sessions: {
     a: { client, sessionId: 'a', totalTokens: 10, costUsd: 1, t3ThreadId, title: 'private' }
   } });
@@ -464,8 +466,7 @@ for (const client of ['claude', 'devin']) test(`T3 ${client} identities survive 
   const archive = createSessionUsageArchiveStore({ databasePath: dbPath, legacyPath: path.join(s.home, 'absent.json') });
   const result = archive.capture({ today: period, month: period, allTime: period }, new Date());
   assert.equal(result.error, null); archive.close();
-  const reopened = createSessionUsageArchiveStore({ databasePath: dbPath, legacyPath: path.join(s.home, 'absent.json') });
-  t.after(() => reopened.close());
+  reopened = createSessionUsageArchiveStore({ databasePath: dbPath, legacyPath: path.join(s.home, 'absent.json') });
   assert.equal(reopened.read().sessions[`${client}:a`].periods.today.t3ThreadId, 'app-main');
   const scrubbed = stripSessionTextFromPeriod(period).sessions[`${client}:a`];
   assert.equal(scrubbed.t3ThreadId, 'app-main'); assert.equal(scrubbed.title, undefined);
@@ -576,4 +577,107 @@ test('unknown drivers and Pi file-path identities remain unbound instead of gues
   const s = store(t); s.thread('main');
   for (const driver of ['unknown', 'pi', 'antigravity', 'constructor']) s.provider(driver, 'main', 'same-id', driver);
   assert.equal(readT3SessionRelations(['same-id'], { homeDir: s.home, env: {} }).size, 0);
+});
+
+
+test('superseded started attempts keep historical identity and delegation through native restart', t => {
+  const s = store(t); pair(s);
+  const old = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  s.db.exec(`CREATE TABLE orchestration_v2_projection_run_attempts (
+    thread_id TEXT, provider_thread_id TEXT, root_node_id TEXT, status TEXT, payload_json TEXT)`);
+  s.db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)')
+    .run('child-root', 'child', 'child-root', 'root_turn', 'child-provider');
+  const insert = s.db.prepare('INSERT INTO orchestration_v2_projection_run_attempts VALUES (?, ?, ?, ?, ?)');
+  insert.run('child', 'child-provider', 'child-root', 'superseded', JSON.stringify({ nativeThreadId: old }));
+  insert.run('wrong', 'child-provider', 'child-root', 'superseded', JSON.stringify({ nativeThreadId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' }));
+  insert.run('child', 'child-provider', 'child-root', 'superseded', JSON.stringify({}));
+  const facts = readT3SessionRelations([old, 'child-native', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'], { homeDir: s.home, env: {} });
+  assert.equal(facts.get(`claude:${old}`).threadId, 'child');
+  assert.equal(facts.get(`claude:${old}`).parentThreadId, 'parent');
+  assert.equal(facts.has('claude:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'), false);
+  const periods = { month: normalizePeriod({ sessions: {
+    a: { client: 'codex', sessionId: 'parent-native', totalTokens: 10, lastUsedAt: new Date().toISOString() },
+    b: { client: 'claude', sessionId: old, totalTokens: 20, lastUsedAt: new Date().toISOString() },
+    c: { client: 'claude', sessionId: 'child-native', totalTokens: 30, lastUsedAt: new Date().toISOString() }
+  } }) };
+  applyT3SessionParents(periods, s.home, { env: {} });
+  const [group, ...others] = require('../../src/electron/renderer/edgeDock/presentation').recentSessionRows({ periods }, 100);
+  assert.equal(others.length, 0); assert.equal(group.groupRows.length, 3);
+  assert.equal(group.subagentCount, 1); assert.equal(group.totalTokens, 60);
+});
+
+for (const driver of ['codex', 'claudeAgent', 'acpRegistry']) test(`stored uppercase ${driver} UUIDs match normalized accounting IDs without changing opaque ACP IDs`, t => {
+  const s = store(t); s.thread('main');
+  registry(s, { a: { driver: 'acpRegistry', config: { agentId: 'claude-acp' } }, b: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const old = 'ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee';
+  s.provider('p', 'main', id.toUpperCase(), driver, 'strong', 'a');
+  s.db.exec(`CREATE TABLE orchestration_v2_projection_run_attempts (
+    thread_id TEXT, provider_thread_id TEXT, root_node_id TEXT, status TEXT, payload_json TEXT)`);
+  s.db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)').run('root', 'main', 'root', 'root_turn', 'p');
+  s.db.prepare('INSERT INTO orchestration_v2_projection_run_attempts VALUES (?, ?, ?, ?, ?)')
+    .run('main', 'p', 'root', 'superseded', JSON.stringify({ nativeThreadId: old.toUpperCase() }));
+  const client = driver === 'codex' ? 'codex' : 'claude';
+  const facts = readT3SessionRelations([id, old], { homeDir: s.home, env: {} });
+  assert.equal(facts.get(`${client}:${id}`).threadId, 'main');
+  assert.equal(facts.get(`${client}:${old}`).threadId, 'main');
+  s.provider('opaque', 'main', id.toUpperCase(), 'acpRegistry', 'strong', 'b');
+  assert.equal(readT3SessionRelations([id], { homeDir: s.home, env: {} }).has(`devin:${id.toUpperCase()}`), false);
+  assert.equal(readT3SessionRelations([id.toUpperCase()], { homeDir: s.home, env: {} }).get(`devin:${id.toUpperCase()}`).threadId, 'main');
+});
+
+test('targeted relationship lookup queries only targets while historical parent evidence still resolves', t => {
+  const s = store(t); pair(s);
+  const periods = { today: normalizePeriod({ sessions: { c: { client: 'claude', sessionId: 'child-native', totalTokens: 10 } } }),
+    month: normalizePeriod({ sessions: { p: { client: 'codex', sessionId: 'parent-native', totalTokens: 30 },
+      h: { client: 'codex', sessionId: 'unrelated-history', totalTokens: 20 } } }) };
+  const lookups = [];
+  class DatabaseSync extends sqlite.DatabaseSync {
+    prepare(sql) {
+      const statement = super.prepare(sql);
+      if (!sql.startsWith('SELECT p.driver,')) return statement;
+      return { all: (...args) => { lookups.push(args); return statement.all(...args); } };
+    }
+  }
+  const child = periods.today.sessions['claude:child-native'];
+  applyT3SessionParents(periods, s.home, { env: {}, sqlite: { DatabaseSync } }, new Set([child]));
+  assert.equal(child.parentSessionId, 'parent-native');
+  assert.equal(child.parentClient, 'codex');
+  assert.equal(lookups.flat().includes('unrelated-history'), false);
+  assert.equal(lookups.flat().includes('parent-native'), false, 'historical evidence is not a DB lookup target');
+  assert.equal(periods.month.sessions['codex:parent-native'].t3ThreadId, undefined, 'evidence is read-only');
+});
+
+
+test('anchored SQLite metadata preserves the resolvable Month parent pair across provider switches', async t => {
+  const { collectUsageOnce } = require('../../src/shared/collector');
+  const { localDayKey } = require('../../src/shared/history');
+  const s = store(t); pair(s);
+  s.provider('parent-claude', 'parent', 'claude-new-parent', 'claudeAgent');
+  const scan = today => ({ entries: [
+    { client: today ? 'codex' : 'claude', sessionId: today ? 'parent-native' : 'claude-new-parent', lastUsedAt: new Date().toISOString(), model: 'm', input: today ? 10 : 50, cost: 1 },
+    { client: 'claude', sessionId: 'child-native', ...(today ? { parentSessionId: 'parent-native', parentClient: 'codex' } : {}), lastUsedAt: new Date().toISOString(), model: 'm', input: 20, cost: 2 }
+  ] });
+  let captured;
+  const options = { clients: 'codex,claude', homeDir: s.home, projectsEnabled: false, historyEnabled: false,
+    limitsEnabled: false, wslScanEnabled: false, osInfo: {}, env: {},
+    sessionMetadataDeps: { scopedHome: true, sessionMetadataResolvers: new Map() },
+    onAnchorComputed: value => { captured = value; }, runTokscale: async ({ flags }) => scan(flags.includes('--today')) };
+  const full = await collectUsageOnce(options);
+  assert.equal(full.today.sessions['claude:child-native'].parentClient, 'codex');
+  assert.equal(full.month.sessions['claude:child-native'].parentSessionId, 'claude-new-parent');
+  assert.equal(full.month.sessions['claude:child-native'].parentClient, undefined);
+  const next = await collectUsageOnce({ ...options, todayOnlyAnchor: { dateKey: localDayKey(new Date()),
+    today: full.today, month: full.month, allTime: full.allTime, todayPartitions: captured.todayPartitions,
+    sessionIdentityVersion: captured.sessionIdentityVersion } });
+  for (const name of ['month', 'allTime']) {
+    const child = next[name].sessions['claude:child-native'];
+    assert.equal(child.parentSessionId, 'claude-new-parent');
+    assert.equal(child.parentClient, undefined, 'fresh Codex namespace cannot attach to the retained Claude parent ID');
+    assert.equal(next[name].totalTokens, full[name].totalTokens);
+    assert.equal(next[name].costUsd, full[name].costUsd);
+  }
+  const rows = require('../../src/electron/renderer/sessionRows');
+  const groups = rows.groupSessionRows(rows.sessionRowsForPeriod(next.month));
+  assert.equal(groups.length, 1); assert.equal(groups[0].groupRows.length, 2);
 });

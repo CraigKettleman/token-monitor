@@ -586,7 +586,7 @@
     if (grouped.size === 0) return list;
     return list
       .filter(row => !grouped.has(row?.key))
-      .map(row => children.has(row?.key) ? subagentGroupRow(row, children.get(row.key), options) : row);
+      .map(row => children.has(row?.key) ? subagentGroupRow(row, children.get(row.key), options, conflicts.has(identity(row))) : row);
   }
 
   // The group row is the parent's own row with the group's totals: members are
@@ -597,7 +597,7 @@
     return row.client === 'codex' && row.nativeSessionId ? `codex:${row.nativeSessionId}` : row.key;
   }
 
-  function subagentGroupRow(parent, members, options) {
+  function subagentGroupRow(parent, members, options, splitIdentity = false) {
     const sameConversation = row => sessionConversationIdentity(row) === sessionConversationIdentity(parent);
     const all = [parent, ...members];
     const main = all.filter(sameConversation).sort((a, b) => finiteNumber(b.sortTime) - finiteNumber(a.sortTime));
@@ -611,7 +611,7 @@
       || parent.activityState;
     const countLabel = subagentCount === 0 ? '' : (typeof options.countLabel === 'function'
       ? options.countLabel(subagentCount) : `${subagentCount} subagents`);
-    const id = `subagents:${sessionConversationIdentity(parent).replace(/^session:/, '')}`;
+    const id = `subagents:${sessionConversationIdentity(parent).replace(/^session:/, '')}${splitIdentity ? `:root:${encodeURIComponent(parent.key)}` : ''}`;
     // The model label and its tooltip describe the tokens the row shows, which
     // are the whole group's, so they are rebuilt from every member's models.
     const models = {};
@@ -646,6 +646,7 @@
       groupDetail: countLabel,
       value,
       cost,
+      tokenDataUnavailable: groupRows.every(row => row.tokenDataUnavailable === true),
       ...(unpricedTokens > 0 ? { unpricedTokens } : {}),
       barValue: value,
       running: groupRows.some(row => row.running === true) || undefined,

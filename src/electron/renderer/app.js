@@ -2369,7 +2369,7 @@ function updateRowLive(row, activityState, activityAt) {
   dot.classList.add('pulse');
 }
 
-function updateRow(row, { name, subtitle, subtitleIdentity, subagentCountLabel, activity, detail, value, cost, unpricedTokens, barValue, max, color, barBackground, accordionRows, deviceDetail, stale, platform, local, client, kind, modelSource, cacheReadTokens, outputTokens, unclassifiedTokens, modelRows, modelLabel, modelTooltipEntries, tokenDataUnavailable, sessionDetailAvailable, sessionGroup, running, activityState, context, promptCache, contextSnapshot, sortTime }) {
+function updateRow(row, { name, subtitle, subtitleIdentity, subagentCountLabel, activity, detail, value, cost, unpricedTokens, barValue, max, color, barBackground, accordionRows, deviceDetail, stale, platform, local, client, kind, modelSource, cacheReadTokens, outputTokens, unclassifiedTokens, modelRows, modelLabel, modelTooltipEntries, titleModelLabel, tokenDataUnavailable, sessionDetailAvailable, sessionGroup, running, activityState, context, promptCache, contextSnapshot, sortTime }) {
   const width = rowWidth(barValue, max);
   const isExpanded = row.classList.contains('expanded');
   // `running` still drives the row class for layout, but the mark's own state
@@ -2433,10 +2433,11 @@ function updateRow(row, { name, subtitle, subtitleIdentity, subagentCountLabel, 
   // client · model line, so the trigger is just the "N models" span; an
   // untitled row folds it into the title instead, whose whole text then opens
   // the tooltip. The trigger mirrors the row's own wording rather than adding
-  // chrome, so there is nothing extra on a single-model row.
+  // chrome, so there is nothing extra on a single-model row. A review heading
+  // explicitly identifies its model span before the trailing time.
   const modelEntries = Array.isArray(modelTooltipEntries) && modelTooltipEntries.length > 1
     ? modelTooltipEntries : null;
-  const subtitleShowsModel = Boolean(modelEntries && modelLabel && String(subtitleText || '').endsWith(modelLabel));
+  const subtitleShowsModel = Boolean(!titleModelLabel && modelEntries && modelLabel && String(subtitleText || '').endsWith(modelLabel));
   if (subtitleShowsModel) {
     const models = document.createElement('span');
     models.className = 'session-models';
@@ -2449,7 +2450,16 @@ function updateRow(row, { name, subtitle, subtitleIdentity, subagentCountLabel, 
   } else {
     setHoverMarqueeText(subtitleTextEl, subtitleText);
   }
-  if (!subtitleShowsModel && modelEntries && modelLabel && String(name || '').endsWith(modelLabel)) {
+  if (modelEntries && titleModelLabel && String(name || '').startsWith(titleModelLabel)) {
+    const models = document.createElement('span');
+    models.className = 'session-models';
+    models.textContent = titleModelLabel;
+    const titleContent = titleEl.querySelector('.overflow-text-content') || titleEl;
+    titleContent.replaceChildren(models, document.createTextNode(name.slice(titleModelLabel.length)));
+    overflowText.update(titleEl);
+    limitWindowsView.setDetailTooltip(models, modelEntries);
+  }
+  if (!subtitleShowsModel && !titleModelLabel && modelEntries && modelLabel && String(name || '').endsWith(modelLabel)) {
     limitWindowsView.setDetailTooltip(titleEl, modelEntries);
   } else if (titleEl.classList.contains('limit-detail-tooltip-wrap')) {
     limitWindowsView.setDetailTooltip(titleEl, null);
@@ -4876,7 +4886,7 @@ function sessionGroupRunNode(row, max, parent) {
       || t('sessions.backgroundReviews');
   // Group members are still session rows. Share the template, metrics, tooltip
   // and activity rendering; exchange rows belong only to the actual transcript.
-  const member = { ...row, name: title };
+  const member = { ...row, name: title, titleModelLabel: namedGroup ? undefined : row.modelLabel };
   if (subagentGroup) {
     member.subtitle = [row.clientLabel, row.modelLabel].filter(Boolean).join(' · ');
     member.activity = row.activitySummary;

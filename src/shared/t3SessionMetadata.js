@@ -208,10 +208,18 @@ function readT3SessionMeta(sessionIds, deps = {}) {
 // not a subagent, and the parent's currently active provider may have changed
 // since it dispatched the task. The execution root records the launch identity.
 
-// App thread identity is independent of provider identity. Resumes, provider
-// switches and accepted run attempts can all belong to the same app thread.
+// App identity survives provider switches and accepted historical attempts.
+// Require strong driver-matching refs and provider/thread/root ownership.
+// Delegation requires explicit subagent lineage plus forkedFrom.nodeId pointing
+// to a subagent node under its launching root. Running app-owned tasks may lack
+// provider_thread_id: projection_subagents must then prove origin, parent and
+// child_thread_id. Completed nodes may instead name their child provider.
+// Never use the parent's current default provider, human forks or prompt text.
 function readT3SessionRelations(nativeIds, deps = {}) {
   const ids = [...new Set(Array.from(nativeIds || []).map(String).filter(Boolean))];
+  const requested = new Set(ids);
+  const uuidIds = [...new Set(ids.filter(id => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)).map(id => id.toLowerCase()))];
+  const requestedUuids = new Set(uuidIds);
   const out = new Map();
   const ambiguous = new Set();
   const ambiguousParents = new Set();
@@ -249,7 +257,8 @@ function readT3SessionRelations(nativeIds, deps = {}) {
         const client = t3AccountingClient(row.driver, row.instanceId, bindings);
         const id = nativeAccountingId(client, row.nativeId, row.historical);
         const threadId = cleanText(row.threadId);
-        if (!client || !id || !threadId) return;
+        if (!client || !id || !threadId || (!requested.has(id)
+          && !(['codex', 'claude'].includes(client) && requestedUuids.has(id)))) return;
         const key = `${client}:${id}`;
         if (ambiguous.has(key)) return;
         if (out.has(key) && out.get(key).threadId !== threadId) {
@@ -265,11 +274,13 @@ function readT3SessionRelations(nativeIds, deps = {}) {
         const sql = `SELECT p.driver, ${instance('p')} AS instanceId, ${native('p', 'nativeId')} AS nativeId, p.thread_id AS threadId
           FROM ${names.p} p JOIN ${names.t} t ON t.thread_id = p.thread_id
           WHERE t.deleted_at IS NULL AND ${strong}
-            AND ${native('p', 'nativeId')} IN (${params})`;
-        for (const row of db.prepare(sql).all(...chunk)) add(row);
+            AND (${native('p', 'nativeId')} IN (${params})
+              OR lower(${native('p', 'nativeId')}) IN (SELECT value FROM json_each(?)))`;
+        for (const row of db.prepare(sql).all(...chunk, JSON.stringify(chunk.filter(id => requestedUuids.has(id.toLowerCase())).map(id => id.toLowerCase())))) add(row);
       }
       // T3 stamps nativeThreadId after a provider turn starts. It is retained
-      // when a resume failure replaces nativeThreadRef on the provider row.
+      // when steering supersedes a started turn or a restart replaces the native
+      // reference. Superseded attempts can already have accounted usage.
       // Validate the attempt's provider and root ownership before using it.
       // Pin join order: SQLite otherwise scans every message/tool node first.
       if (has('a', ['thread_id', 'provider_thread_id', 'root_node_id', 'status', 'payload_json'])
@@ -282,9 +293,10 @@ function readT3SessionRelations(nativeIds, deps = {}) {
               AND root.thread_id = a.thread_id AND root.provider_thread_id = a.provider_thread_id
               AND root.kind = 'root_turn'
             WHERE t.deleted_at IS NULL AND ${strong}
-              AND a.status IN ('running', 'completed', 'failed', 'interrupted', 'cancelled')
-              AND json_extract(${json('a')}, '$.nativeThreadId') IN (SELECT value FROM json_each(?))`;
-        for (const row of db.prepare(history).all(JSON.stringify(ids))) add(row);
+              AND a.status IN ('running', 'completed', 'failed', 'interrupted', 'cancelled', 'superseded')
+              AND (json_extract(${json('a')}, '$.nativeThreadId') IN (SELECT value FROM json_each(?))
+                OR lower(json_extract(${json('a')}, '$.nativeThreadId')) IN (SELECT value FROM json_each(?)))`;
+        for (const row of db.prepare(history).all(JSON.stringify(ids), JSON.stringify(uuidIds))) add(row);
       }
       if (!has('n', ['node_id', 'thread_id', 'root_node_id', 'kind', 'provider_thread_id'])) continue;
       const threads = [...new Set([...facts.values()].map(fact => fact.threadId))];
