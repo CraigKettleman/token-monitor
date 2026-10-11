@@ -7,7 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 const sqlite = require('node:sqlite');
 const { readT3SessionParents, readT3SessionRelations } = require('../../src/shared/t3SessionMetadata');
-const { applySessionMetadata, applyT3SessionParents } = require('../../src/shared/sessionMetadata');
+const { applySessionMetadata, applyT3SessionParents, applySessionIdentities } = require('../../src/shared/sessionMetadata');
 const { normalizePeriod, mergePeriods, extractUsageFromTokscale, stripSessionTextFromPeriod } = require('../../src/shared/usage');
 
 function store(t) {
@@ -624,6 +624,37 @@ for (const driver of ['codex', 'claudeAgent', 'acpRegistry']) test(`stored upper
   s.provider('opaque', 'main', id.toUpperCase(), 'acpRegistry', 'strong', 'b');
   assert.equal(readT3SessionRelations([id], { homeDir: s.home, env: {} }).has(`devin:${id.toUpperCase()}`), false);
   assert.equal(readT3SessionRelations([id.toUpperCase()], { homeDir: s.home, env: {} }).get(`devin:${id.toUpperCase()}`).threadId, 'main');
+});
+
+for (const header of [true, false]) test(`Codex ${header ? 'header' : 'filename'} UUID candidates enrich consistently without changing accounting or opaque ACP identities`, t => {
+  const s = store(t); s.thread('parent'); s.thread('child', 'parent'); s.thread('opaque');
+  const parent = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const child = 'ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee';
+  s.provider('parent-provider', 'parent', parent);
+  s.provider('child-provider', 'child', child);
+  s.delegation('child-provider', 'parent-provider', 'parent');
+  registry(s, { devin: { driver: 'acpRegistry', config: { agentId: 'devin' } } });
+  s.provider('opaque-provider', 'opaque', child.toUpperCase(), 'acpRegistry', 'strong', 'devin');
+  const dir = path.join(s.home, '.codex', 'sessions');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'parent-rollout.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: parent.toUpperCase() } }) + '\n');
+  fs.writeFileSync(path.join(dir, 'child-rollout.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: child.toUpperCase() } }) + '\n');
+  const parentId = header ? 'parent-rollout' : `rollout-${parent.toUpperCase()}`;
+  const childId = header ? 'child-rollout' : `rollout-${child.toUpperCase()}`;
+  const periods = { month: normalizePeriod({ sessions: {
+    p: { client: 'codex', sessionId: parentId, totalTokens: 10, costUsd: 1 },
+    c: { client: 'codex', sessionId: childId, totalTokens: 20, costUsd: 2 },
+    d: { client: 'devin', sessionId: child, totalTokens: 30, costUsd: 3 }
+  } }) };
+  const before = Object.entries(periods.month.sessions).map(([key, row]) => [key, row.totalTokens, row.costUsd]);
+  applySessionIdentities(periods, s.home, { env: {} });
+  assert.equal(periods.month.sessions[`codex:${parentId}`].t3ThreadId, 'parent');
+  assert.equal(periods.month.sessions[`codex:${childId}`].t3ThreadId, 'child');
+  assert.equal(periods.month.sessions[`codex:${childId}`].parentSessionId, parentId);
+  assert.equal(periods.month.sessions[`codex:${childId}`].parentClient, undefined);
+  assert.equal(periods.month.sessions[`devin:${child}`].t3ThreadId, undefined, 'opaque UUID-shaped ACP ids stay case sensitive');
+  assert.deepEqual(Object.entries(periods.month.sessions).map(([key, row]) => [key, row.totalTokens, row.costUsd]), before);
+  if (header) assert.equal(periods.month.sessions[`codex:${childId}`].nativeSessionId, child.toUpperCase(), 'verified header identity is retained verbatim');
 });
 
 test('targeted relationship lookup queries only targets while historical parent evidence still resolves', t => {

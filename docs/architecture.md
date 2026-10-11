@@ -104,11 +104,11 @@ The widget runs the collector, the usage transform (`src/shared/usage/usageTrans
 
 ## Session relationships
 
-Native links take precedence over T3 Code's read-only, app-owned delegation evidence. The [shared reader](../src/shared/t3SessionMetadata.js) verifies provider, thread and execution-root ownership; human forks, weak identities and conflicts supply no parent link. [Accounting bindings](../src/shared/t3SessionIdentity.js) match native IDs exactly, including configured ACP agents; unknown/custom executables and incompatible IDs remain unbound. Relationships read no conversation content and do not broaden title collection or sync consent.
+Native links take precedence over T3 Code's read-only, app-owned delegation evidence. The [shared reader](../src/shared/t3SessionMetadata.js) verifies provider, thread and execution-root ownership; human forks, weak identities and conflicts supply no parent link. [Accounting bindings](../src/shared/t3SessionIdentity.js) normalize Codex/Claude UUID case and match opaque ACP IDs exactly; unknown/custom executables and incompatible IDs remain unbound. Relationships read no conversation content and do not broaden title collection or sync consent.
 
 `client:sessionId` remains the accounting key. Optional `t3ThreadId` joins verified runs of one App conversation; Codex `nativeSessionId` joins verified continuation headers. `parentSessionId` and optional `parentClient` form one atomic link, with the client defaulting to the child's. Normalization, archives and sync retain these identities and reject conflicting device evidence. A missing parent creates no synthetic usage.
 
-Watch ticks look up only today's members and derived copies; historical maps remain parent evidence. Native refreshes target only local rows and share accounting maps. Anchors receive one metadata-only identity upgrade per version, preserving frozen counters and `fullScanAt`.
+Watch ticks look up only today's members and derived copies; historical maps remain parent evidence. Native refreshes target only local rows and share accounting maps. Anchors persist confirmed identities and atomic parent links before advancing the metadata upgrade version, preserving frozen counters and `fullScanAt`.
 
 Sessions, Home and Edge Dock share grouping before recent/running caps. Sum each accounting member once; count distinct delegated conversations, and derive activity and token availability from all members. Context/cache snapshots remain the latest main member's own readings. Cycles and conflicting parents retain every member with distinct group identities. Sessions keeps Codex Auto Review global; Home/Dock exclude it. Grok Bot remains global. Antigravity relationships and iOS grouping are follow-ups.
 

@@ -842,7 +842,7 @@ test('flat catalog project provenance requires a full scan instead of guessing p
   assert.ok(collectorAnchorTrust({ ...anchor, catalogProjects: { today: { 'antigravity:session': 'project-a' }, month: {}, allTime: {} } }, options));
 });
 
-test('old persisted anchors upgrade conversation identities once without changing the frozen usage baseline', async t => {
+for (const nativeChild of [false, true]) test(`old persisted anchors retain ${nativeChild ? 'native same-client' : 'T3 cross-client'} parent links through refresh and restart`, async t => {
   const { DatabaseSync } = require('node:sqlite');
   const { normalizePeriod } = require('../../src/shared/usage');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-identity-anchor-'));
@@ -857,28 +857,42 @@ test('old persisted anchors upgrade conversation identities once without changin
     fs.rmSync(home, { recursive: true, force: true });
   });
   const native = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const childNative = nativeChild ? 'cccccccc-cccc-cccc-cccc-cccccccccccc' : 'opaque-devin';
+  const childClient = nativeChild ? 'codex' : 'devin';
+  const childId = nativeChild ? 'historical-child' : childNative;
+  const childKey = `${childClient}:${childId}`;
   const historyDir = path.join(home, '.codex', 'sessions');
   fs.mkdirSync(historyDir, { recursive: true });
   fs.writeFileSync(path.join(historyDir, 'historical.jsonl'), JSON.stringify({ type: 'session_meta', payload: { id: native } }) + '\n');
+  if (nativeChild) fs.writeFileSync(path.join(historyDir, `${childId}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: childNative } }) + '\n');
   const dbPath = path.join(home, 't3.sqlite');
   const db = new DatabaseSync(dbPath);
   db.exec(`CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, deleted_at TEXT, payload_json TEXT);
-    CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, driver TEXT, payload_json TEXT);`);
+    CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, driver TEXT, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_nodes (node_id TEXT PRIMARY KEY, thread_id TEXT, root_node_id TEXT, kind TEXT, provider_thread_id TEXT);`);
   db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('app-thread', '{}');
   db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('provider', 'app-thread', 'codex',
     JSON.stringify({ nativeThreadRef: { nativeId: native, driver: 'codex', strength: 'strong' } }));
-  db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('devin-app', '{}');
-  db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('devin-provider', 'devin-app', 'acpRegistry',
-    JSON.stringify({ providerInstanceId: 'configured-devin', nativeThreadRef: { nativeId: 'opaque-devin', driver: 'acpRegistry', strength: 'strong' } }));
+  db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES (?, NULL, ?)').run('devin-app', JSON.stringify({
+    lineage: { parentThreadId: 'app-thread', relationshipToParent: 'subagent' },
+    forkedFrom: { type: 'node', nodeId: 'task' }
+  }));
+  db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)').run('devin-provider', 'devin-app', nativeChild ? 'codex' : 'acpRegistry',
+    JSON.stringify({ providerInstanceId: 'configured-devin', nativeThreadRef: { nativeId: childNative, driver: nativeChild ? 'codex' : 'acpRegistry', strength: 'strong' } }));
+  db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)').run('root', 'app-thread', 'root', 'root_turn', 'provider');
+  db.prepare('INSERT INTO orchestration_v2_projection_nodes VALUES (?, ?, ?, ?, ?)').run('task', 'app-thread', 'root', 'subagent', 'devin-provider');
   fs.writeFileSync(path.join(home, 'settings.json'), JSON.stringify({ providerInstances: { 'configured-devin': { driver: 'acpRegistry', config: { agentId: 'devin' } } } }));
   db.close();
   const period = (history = false) => normalizePeriod({ totalTokens: history ? 40 : 10, costUsd: history ? 4 : 1,
     sessions: { 'codex:today': { client: 'codex', sessionId: 'today', totalTokens: 10, costUsd: 1 },
-      ...(history ? { 'codex:historical': { client: 'codex', sessionId: 'historical', totalTokens: 30, costUsd: 3 },
-        'devin:opaque-devin': { client: 'devin', sessionId: 'opaque-devin', totalTokens: 0, costUsd: 0 } } : {}) } });
+      ...(history ? { 'codex:historical': { client: 'codex', sessionId: 'historical', totalTokens: 10, costUsd: 1 },
+        [childKey]: { client: childClient, sessionId: childId, totalTokens: 20, costUsd: 2,
+          ...(nativeChild ? { parentSessionId: 'today' } : {}) } } : {}) } });
   const file = path.join(home, 'collector-anchor.json');
   const capturedAt = new Date().toISOString();
-  fs.writeFileSync(file, JSON.stringify({ dateKey: localTodayKey(), today: period(), month: period(true), allTime: period(true),
+  const anchorPeriods = { today: period(), month: period(true), allTime: period(true) };
+  if (nativeChild) for (const period of ['month', 'allTime']) anchorPeriods[period].sessions[childKey].parentClient = 'codex';
+  fs.writeFileSync(file, JSON.stringify({ dateKey: localTodayKey(), ...anchorPeriods,
     configFingerprint: configFingerprint('codex', '2024-01-01', false), fullScanAt: capturedAt, sessionIdentityVersion: 1 }));
   const scans = [], resolved = [], updates = [];
   const options = { ...baseOptions, clients: 'codex', homeDir: home, projectsEnabled: false,
@@ -895,7 +909,27 @@ test('old persisted anchors upgrade conversation identities once without changin
   handle = freshCollector().startCollector(options);
   await waitForCondition(() => updates.length === 1);
   await handle.whenIdle();
+  const { sessionRowsForPeriod, groupSessionRows } = require('../../src/electron/renderer/sessionRows');
+  const checkFamily = summary => {
+    for (const period of ['month', 'allTime']) {
+      const child = summary[period].sessions[childKey];
+      assert.ok(['today', 'historical'].includes(child.parentSessionId));
+      assert.equal(child.parentClient, nativeChild ? undefined : 'codex');
+      if (nativeChild) assert.equal(child.parentSessionId, 'today', 'native parent takes precedence over the T3-selected historical parent');
+      const [group, ...others] = groupSessionRows(sessionRowsForPeriod(summary[period]));
+      assert.equal(others.length, 0);
+      assert.equal(group.subagentCount, 1);
+      assert.equal(group.groupRows.length, 3);
+      assert.equal(group.value, 50);
+      assert.equal(group.cost, 5);
+    }
+  };
+  checkFamily(updates[0]);
   assert.equal(scans.length, 1, 'migration uses the ordinary today scan, never new historical token scans');
+  await handle.tick('watch', { todayOnly: true });
+  await handle.whenIdle();
+  assert.equal(updates.length, 2);
+  checkFamily(updates[1]);
   assert.equal(resolved.includes('historical'), false, 'migration only reads identity headers, never full historical metadata');
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(saved.sessionIdentityVersion, 2);
@@ -904,16 +938,23 @@ test('old persisted anchors upgrade conversation identities once without changin
   assert.equal(saved.month.totalTokens, 40);
   assert.equal(saved.month.sessions['codex:historical'].nativeSessionId, native);
   assert.equal(saved.month.sessions['codex:historical'].t3ThreadId, 'app-thread');
-  assert.equal(saved.month.sessions['devin:opaque-devin'].t3ThreadId, 'devin-app', 'version-one anchors receive the added client bindings');
+  assert.equal(saved.month.sessions[childKey].t3ThreadId, 'devin-app', 'version-one anchors receive the child app identity');
+  for (const period of ['month', 'allTime']) {
+    assert.equal(saved[period].sessions[childKey].parentSessionId, updates[0][period].sessions[childKey].parentSessionId);
+    assert.equal(saved[period].sessions[childKey].parentClient, nativeChild ? undefined : 'codex', 'same-client links remove the redundant old namespace');
+  }
   assert.equal(updates[0].month.totalTokens, 50, 'today delta is applied exactly once');
   assert.equal(updates[0].month.costUsd, 5);
   handle.stop();
   handle = null;
   resolved.length = 0;
   handle = freshCollector().startCollector(options);
-  await waitForCondition(() => updates.length === 2);
-  assert.equal(scans.length, 2, 'warm restart still scans only today');
+  await waitForCondition(() => updates.length === 3);
+  await handle.whenIdle();
+  checkFamily(updates[2]);
+  assert.deepEqual(scans, [['--today'], ['--today'], ['--today']], 'migration, next tick and restart scan only today');
   assert.equal(resolved.includes('historical'), false, 'upgraded anchors do not reread historical transcripts each tick');
-  assert.equal(updates[1].month.totalTokens, 50, 'warm restart never reapplies an already counted delta');
-  assert.equal(updates[1].month.sessions['codex:historical'].t3ThreadId, 'app-thread');
+  assert.equal(updates[2].month.totalTokens, 50, 'warm restart never reapplies an already counted delta');
+  assert.equal(updates[2].month.sessions['codex:historical'].t3ThreadId, 'app-thread');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), saved, 'refresh and restart preserve the migrated anchor and frozen baseline');
 });

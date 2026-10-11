@@ -352,10 +352,11 @@ function sessionMetadataMap(periods, home = os.homedir(), deps = {}) {
 function applyT3SessionParents(periods, home = os.homedir(), deps = {}, targets, evidencePeriods = periods) {
   const candidates = (session) => {
     if (session.client !== 'codex') return [nativeAccountingId(session.client, session.sessionId)].filter(Boolean);
-    if (session.nativeSessionId) return [session.nativeSessionId];
+    if (session.nativeSessionId) return [nativeAccountingId('codex', session.nativeSessionId)].filter(Boolean);
     // A filename with several UUIDs is ambiguous without a verified header.
     const ids = String(session.sessionId).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [];
-    return new Set(ids.map((id) => id.toLowerCase())).size > 1 ? [] : codexSession.threadIdCandidates(session.sessionId);
+    return new Set(ids.map((id) => id.toLowerCase())).size > 1 ? []
+      : [...new Set(codexSession.threadIdCandidates(session.sessionId).map(id => nativeAccountingId('codex', id)).filter(Boolean))];
   };
   const supported = (session) => supportsT3SessionClient(session?.client) && session.sessionId;
   function* sessions(period) {

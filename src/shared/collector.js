@@ -2957,6 +2957,13 @@ function startCollector(options) {
               for (const field of ['nativeSessionId', 't3ThreadId']) {
                 if (resolved?.[field]) session[field] = resolved[field];
               }
+              // Commit the confirmed link with its namespace before advancing
+              // the migration version; later watch ticks do not revisit history.
+              if (resolved?.parentSessionId) {
+                session.parentSessionId = resolved.parentSessionId;
+                if (resolved.parentClient && resolved.parentClient !== session.client) session.parentClient = resolved.parentClient;
+                else delete session.parentClient;
+              }
             }
           }
           anchor.sessionIdentityVersion = captured.sessionIdentityVersion;
