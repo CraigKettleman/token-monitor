@@ -83,3 +83,51 @@ test('retained archive restores verified conversation identity without persistin
   assert.equal(restored.today.totalTokens, 10);
   assert.equal(restored.today.costUsd, 1);
 });
+
+
+test('header identity accepts an EOF-terminated record and ignores later metadata records', t => {
+  const file = path.join(directory(t), 'session.jsonl');
+  const header = id => JSON.stringify({ type: 'session_meta', payload: { id } });
+  fs.writeFileSync(file, header(ID));
+  assert.equal(nativeIdForFile(file), ID);
+  fs.writeFileSync(file, header(ID) + '\r\n' + header(OTHER) + '\n');
+  assert.equal(nativeIdForFile(file), ID);
+  fs.writeFileSync(file, '{invalid}\n' + header(OTHER) + '\n');
+  assert.equal(nativeIdForFile(file), '', 'a later valid record cannot establish identity');
+  for (const payload of [null, {}, { id: 123 }, { id: {} }]) {
+    fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload }) + '\n');
+    assert.equal(nativeIdForFile(file), '');
+  }
+});
+
+test('header size bound accepts a complete record at 8 MiB but rejects one byte beyond it', t => {
+  const file = path.join(directory(t), 'session.jsonl');
+  const limit = 8 * 1024 * 1024;
+  const header = padding => JSON.stringify({ type: 'session_meta', payload: { id: ID, padding } });
+  const padding = 'x'.repeat(limit - Buffer.byteLength(header('')));
+  const exact = header(padding);
+  assert.equal(Buffer.byteLength(exact), limit);
+  fs.writeFileSync(file, exact);
+  assert.equal(nativeIdForFile(file), ID);
+  fs.writeFileSync(file, header(padding + 'x'));
+  assert.equal(nativeIdForFile(file), '');
+});
+
+test('cached header identity cannot survive deletion or substitution with a directory or symlink', t => {
+  const home = directory(t);
+  const file = path.join(home, 'session.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: ID } }));
+  assert.equal(nativeIdForFile(file), ID);
+  fs.unlinkSync(file);
+  assert.equal(nativeIdForFile(file), '');
+  fs.mkdirSync(file);
+  assert.equal(nativeIdForFile(file), '');
+  fs.rmdirSync(file);
+  // Windows requires symlink privileges; the deletion/directory checks still run there.
+  if (process.platform !== 'win32') {
+    const target = path.join(home, 'target.jsonl');
+    fs.writeFileSync(target, JSON.stringify({ type: 'session_meta', payload: { id: OTHER } }));
+    fs.symlinkSync(target, file);
+    assert.equal(nativeIdForFile(file), '', 'identity must come from a regular rollout file');
+  }
+});

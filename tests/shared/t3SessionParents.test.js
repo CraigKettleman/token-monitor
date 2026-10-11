@@ -712,3 +712,38 @@ test('anchored SQLite metadata preserves the resolvable Month parent pair across
   const groups = rows.groupSessionRows(rows.sessionRowsForPeriod(next.month));
   assert.equal(groups.length, 1); assert.equal(groups[0].groupRows.length, 2);
 });
+
+
+test('relationship queries retain every requested child across the 400-ID query boundary', t => {
+  const s = store(t);
+  s.thread('parent');
+  s.provider('parent-provider', 'parent', 'parent-native');
+  const ids = Array.from({ length: 401 }, (_, i) => `child-native-${i}`);
+  for (const [i, id] of ids.entries()) {
+    s.thread(`child-${i}`, 'parent');
+    s.provider(`provider-${i}`, `child-${i}`, id, 'claudeAgent');
+    s.delegation(`provider-${i}`, 'parent-provider', 'parent');
+  }
+  s.thread('unrequested', 'parent');
+  s.provider('unrequested-provider', 'unrequested', 'unrequested-native', 'claudeAgent');
+  s.delegation('unrequested-provider', 'parent-provider', 'parent');
+  const facts = readT3SessionRelations([...ids, ids[0], 'missing-native'], { homeDir: s.home, env: {} });
+  assert.equal(facts.size, ids.length);
+  for (const [i, id] of ids.entries()) {
+    assert.deepEqual(facts.get(`claude:${id}`), {
+      threadId: `child-${i}`, parentThreadId: 'parent', parentClient: 'codex', parentNativeId: 'parent-native'
+    });
+  }
+  assert.equal(facts.has('claude:unrequested-native'), false);
+});
+
+test('a malformed provider payload does not suppress valid relationship evidence in the same store', t => {
+  const s = store(t);
+  pair(s);
+  s.thread('malformed');
+  s.db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?)')
+    .run('malformed-provider', 'malformed', 'claudeAgent', '{broken');
+  assert.deepEqual(s.read(['child-native', 'malformed-native']), new Map([['claude:child-native', {
+    parentClient: 'codex', parentNativeId: 'parent-native'
+  }]]));
+});

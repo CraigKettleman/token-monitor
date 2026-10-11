@@ -601,3 +601,52 @@ test('T3 app families span main and child provider switches without increasing l
   assert.equal(dock.subagentCount, 2);
   assert.equal(dock.groupRows.filter(row => row.groupRole === 'main').length, 3);
 });
+
+
+test('family activity switches from running to waiting to idle as individual member leases expire', t => {
+  const now = Date.parse('2026-10-11T12:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  const idle = { turnEnded: true, lastUsedAt: new Date(now - 3_600_000).toISOString() };
+  const parent = session('codex', 'parent', { ...idle, liveActivity: {
+    state: 'waiting', source: 'test', observedAt: new Date(now - 1000).toISOString()
+  } });
+  const child = session('claude', 'child', { ...idle, parentSessionId: 'parent', parentClient: 'codex', liveActivity: {
+    state: 'running', source: 'test', observedAt: new Date(now - 2000).toISOString()
+  } });
+  const stats = { periods: { today: { sessions: { 'codex:parent': parent, 'claude:child': child } } } };
+  const [group] = presentation.recentSessionRows(stats);
+  const runningExpiry = now - 2000 + sessionLive.LIVE_ACTIVITY_TTL_MS;
+  const waitingExpiry = now - 1000 + sessionLive.LIVE_ACTIVITY_TTL_MS;
+  assert.equal(presentation.sessionActivityState(group, now), 'running');
+  assert.equal(presentation.waitingSessionSummary([group], now).count, 0);
+  assert.equal(presentation.nextRunningExpiryAt([group], now), runningExpiry);
+  assert.equal(presentation.sessionActivityState(group, runningExpiry), 'waiting');
+  assert.equal(presentation.runningSessionSummary([group], runningExpiry).count, 0);
+  assert.equal(presentation.waitingSessionSummary([group], runningExpiry).count, 1);
+  assert.equal(presentation.nextRunningExpiryAt([group], runningExpiry), waitingExpiry);
+  assert.equal(presentation.sessionActivityState(group, waitingExpiry), 'idle');
+  assert.equal(presentation.nextRunningExpiryAt([group], waitingExpiry), 0);
+});
+
+test('zero recent cap retains complete running and waiting families while excluding quiet groups', t => {
+  const now = Date.parse('2026-10-11T12:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  const rows = [];
+  for (const state of ['running', 'waiting', 'idle']) {
+    const idle = { turnEnded: true, lastUsedAt: new Date(now - 3_600_000).toISOString() };
+    rows.push(session('codex', state, idle));
+    rows.push(session('claude', `${state}-child`, { ...idle, parentSessionId: state, parentClient: 'codex',
+      liveActivity: { state, source: 'test', observedAt: new Date(now).toISOString() } }));
+  }
+  const stats = { periods: { today: { sessions: Object.fromEntries(rows.map(row => [`${row.client}:${row.sessionId}`, row])) } } };
+  for (const options of [{}, { includeRunningBeyondCap: true }]) {
+    const groups = presentation.recentSessionRows(stats, 0, options);
+    assert.deepEqual(groups.map(group => presentation.sessionActivityState(group)).sort(), ['running', 'waiting']);
+    assert.ok(groups.every(group => group.groupRows.length === 2 && group.totalTokens === 200));
+    assert.equal(presentation.sessionMembers(groups).length, 4);
+  }
+  const running = presentation.recentSessionRows(stats, 0, { runningOnly: true });
+  assert.equal(running.length, 1);
+  assert.equal(running[0].groupRows.length, 2);
+  assert.equal(presentation.sessionActivityState(running[0]), 'running');
+});
