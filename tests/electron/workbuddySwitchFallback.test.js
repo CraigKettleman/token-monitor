@@ -1,11 +1,11 @@
 'use strict';
 
-// WorkBuddy's own auth file is the authority, and these tests pin down what
-// happens when it stops being readable: the app sealing its credential fields is
-// the state that motivated the fallback, and it must not be reported as a
-// signed-out app. The fallback source is workbuddy-switch's accounts.json — a
-// file the user's own tooling writes and Token Monitor only reads, never
-// decrypts or rewrites.
+// WorkBuddy answers once per account from the accounts workbuddy-switch holds,
+// and falls back to the app's own file for an install that does not have it.
+// These tests pin the order and the boundaries: a sealed app credential is the
+// state that motivated reading a second source at all, and it must not be
+// reported as a signed-out app. The switch file is written by the user's own
+// tooling; Token Monitor only reads it, never decrypts or rewrites it.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -103,11 +103,15 @@ function billingResponse(accountId) {
   };
 }
 
-test('WorkBuddy reads its own auth file before the switch fallback', async () => {
+test('WorkBuddy reads the switch accounts before the app file', async () => {
   const fixture = createFixture();
   try {
+    // The app file is readable here, and it still loses: it can only ever
+    // describe the one account that is currently active, while the switch file
+    // is the user's own tool for holding several. Reading the app file first
+    // would hide every account but the active one.
     fs.writeFileSync(fixture.authPath, JSON.stringify(sessionDocument()), 'utf8');
-    writeSwitch(fixture, [switchAccount(), switchAccount({ uid: 'switch-user-b' })]);
+    writeSwitch(fixture, [switchAccount(), switchAccount({ uid: 'switch-user-b', access_token: 'switch-token-b' })]);
     const requested = [];
     const auth = createAuth(fixture, {
       fetch: async (url, init) => {
@@ -116,6 +120,28 @@ test('WorkBuddy reads its own auth file before the switch fallback', async () =>
       }
     });
 
+    assert.equal(auth.sessions().length, 2);
+    assert.equal(auth.getSessionInfo().userId, 'switch-user-a');
+    await auth.request(BILLING_URL, { method: 'POST' });
+    assert.deepEqual([...requested].sort(), ['switch-user-a', 'switch-user-b']);
+  } finally {
+    fs.rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('WorkBuddy falls back to the app file when the switch file has nothing', async () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(fixture.authPath, JSON.stringify(sessionDocument()), 'utf8');
+    const requested = [];
+    const auth = createAuth(fixture, {
+      fetch: async (url, init) => {
+        requested.push(init.headers['X-User-Id']);
+        return billingResponse(init.headers['X-User-Id']);
+      }
+    });
+
+    // An install without workbuddy-switch reads exactly what it read before.
     assert.equal(auth.getSessionInfo().userId, 'app-user');
     assert.equal(auth.sessions().length, 1);
     await auth.request(BILLING_URL, { method: 'POST' });
@@ -125,7 +151,7 @@ test('WorkBuddy reads its own auth file before the switch fallback', async () =>
   }
 });
 
-test('WorkBuddy falls back to the switch accounts only when the app file is sealed', async () => {
+test('a sealed app file does not stand in the way of the switch accounts', async () => {
   const fixture = createFixture();
   try {
     fs.writeFileSync(fixture.authPath, JSON.stringify(sealedSessionDocument()), 'utf8');

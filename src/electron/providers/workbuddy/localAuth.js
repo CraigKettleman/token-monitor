@@ -229,10 +229,10 @@ function sessionFromSwitchAccount(entry, now) {
   };
 }
 
-// The fallback source, read only when the app's own file yields no usable
-// session. Absent, unreadable or malformed all mean the same thing here — no
-// accounts from this source — because the caller already has a reason to fall
-// back and a second one would only change the message.
+// The accounts workbuddy-switch holds, which is the primary source. Absent,
+// unreadable or malformed all mean the same thing here — no accounts from this
+// source — because the caller falls through to the app file and a second reason
+// would only change the message.
 function readSwitchSessions(homeDir, fsApi, now) {
   let parsed;
   try {
@@ -301,7 +301,7 @@ function sessionInfo(session, reason = '') {
     departmentInfo: session.departmentInfo,
     domain: session.domain,
     accountType: session.accountType,
-    // The title the limits row shows. Only the switch fallback carries one; the
+    // The title the limits row shows. Only a switch account carries one; the
     // app file describes a single account, whose row the plan word already
     // titles. Kept out of the object entirely when empty so a caller spreading
     // this into a request never sends an empty name as an identity.
@@ -329,7 +329,7 @@ function createWorkbuddyLocalAuth(deps = {}) {
       : authDirectoriesForPlatform(platform, homeDir, env)
     : [];
   // An injected authDirectory means the caller supplied the whole environment,
-  // so the switch fallback is off: reading the real home directory from a test
+  // so the switch source is off: reading the real home directory from a test
   // that asked for one fixture would make the result depend on the machine.
   const switchHomeDir = supported && !deps.authDirectory ? homeDir : null;
   const fetcher = typeof deps.fetch === 'function'
@@ -357,21 +357,19 @@ function createWorkbuddyLocalAuth(deps = {}) {
     return { session: null, reason: WORKBUDDY_SESSION_READ_REASONS.absent };
   }
 
-  // Every account the billing request should cover, in the order the sources
-  // are trusted. The app's own file is the authority: it is what the app itself
-  // wrote, it needs no third-party tool, and it describes the account the user is
-  // actually signed in as. workbuddy-switch is the fallback, and it is the only
-  // source that survives the app sealing its own fields — but it only speaks up
-  // when the app file gave nothing usable, so a normal install reads exactly what
-  // it read before this existed.
+  // Every account the billing request should cover, in the order the sources are
+  // trusted. workbuddy-switch comes first: it is the user's own tool for holding
+  // several accounts, and the app file can only ever describe the one account
+  // that is currently active. The app file is the fallback, so an install
+  // without workbuddy-switch reads exactly what it read before this existed.
   function resolveSessions() {
     const checkedAt = now();
-    const { session, reason } = locateSession();
-    if (session && !session.expired) return { sessions: [session], reason: '' };
     const switched = switchHomeDir
       ? readSwitchSessions(switchHomeDir, fsApi, checkedAt).filter((entry) => !entry.expired)
       : [];
     if (switched.length > 0) return { sessions: switched, reason: '' };
+    const { session, reason } = locateSession();
+    if (session && !session.expired) return { sessions: [session], reason: '' };
     // Nothing usable anywhere: report why the app file failed, which is the
     // reason that tells the user what to do about it.
     return {

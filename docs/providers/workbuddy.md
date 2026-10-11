@@ -70,7 +70,7 @@ That distinction is the whole point: an encrypted credential is not a signed-out
 | `absent`, `incomplete`, `malformed` | `notConfigured` | "Sign in" |
 | `expired` | `unauthorized` | "Sign in again" |
 
-The encrypted row appears only when no account could be read at all. When the fallback source below supplies accounts, they are reported normally and the app file's read reason never reaches the renderer.
+The encrypted row appears only when no account could be read at all. When the switch source below supplies accounts, they are reported normally and the app file's read reason never reaches the renderer.
 
 `expired` is the one state where the read and the request disagree, and it is worth knowing why: `getSessionInfo()` hides an expired session, so the enabled local lane proceeds to a request, and `request()` re-reads the same file and rejects it as `unauthorized`. That rejection is what produces the "Sign in again" prompt.
 
@@ -78,18 +78,20 @@ The encrypted row appears only when no account could be read at all. When the fa
 
 ### Multiple accounts
 
-Sealing the credential is not the only reason the app file is insufficient: it also describes **one** account — whichever was active — while a user can be signed in to several. The reader therefore resolves accounts from two sources, in this order:
+Sealing the credential is not the only reason the app file is insufficient: it also describes **one** account — whichever was active — while a user can be signed in to several. A second source is read first for that reason:
 
-1. **The app's own file.** This is the authority. It needs no third-party tool, and it is what the app itself wrote.
-2. **`~/.wb-switch/accounts.json`**, written by the third-party [`workbuddy-switch`](https://github.com/changexbc/workbuddy-switch) tool. It is read only when the app file yields no usable session, and its entries are already plaintext.
+1. **`~/.wb-switch/accounts.json`**, written by the third-party [`workbuddy-switch`](https://github.com/changexbc/workbuddy-switch) tool. It holds every account the user has signed in to, already in plaintext, and it is the only source that can hold more than one.
+2. **The app's own file**, `workbuddy-desktop.info`. Read when the switch file yields nothing usable.
 
-The fallback is a **read of a file the user's own tooling produced**. Token Monitor does not decrypt anything here, does not hold a key, and does not write to that file; it also never asks the user to install anything. An install without `workbuddy-switch` behaves exactly as it did before this existed. `WORKBUDDY_SWITCH_ACCOUNTS_FILE` and `readSwitchSessions()` are the whole surface.
+The order matters and is not incidental: the app file can only ever describe the account that is currently active, so reading it first would hide every other account a switch install holds. The app file is the fallback, which is what keeps an install without `workbuddy-switch` reading exactly what it read before this existed.
 
-Rules that keep the fallback honest:
+The switch file is a **read of a file the user's own tooling produced**. Token Monitor does not decrypt anything here, does not hold a key, and does not write to that file; it also never asks the user to install anything. `WORKBUDDY_SWITCH_ACCOUNTS_FILE` and `readSwitchSessions()` are the whole surface.
 
-- **The app file is tried first, every time.** A readable, unexpired app session ends the resolution; the fallback is not consulted, so a machine that never sealed its credential sees one row.
-- **An injected `authDirectory` disables the fallback.** A caller that supplies its own auth directory supplies the whole environment, so a test never reads the machine's real `~/.wb-switch`.
-- **Expired fallback entries are skipped**, not repaired, and a uid appearing twice is kept once: either mistake would publish a wrong balance.
+Rules that keep the read honest:
+
+- **The switch accounts win when they exist.** Expired entries are dropped first, so a switch file holding only expired accounts falls through to the app file rather than reporting nothing.
+- **An injected `authDirectory` disables the second source.** A caller that supplies its own auth directory supplies the whole environment, so a test never reads the machine's real `~/.wb-switch`.
+- **Expired entries are skipped**, not repaired, and a uid appearing twice is kept once: either mistake would publish a wrong balance.
 - **A partial entry is dropped.** An entry without both `access_token` and `uid` cannot authenticate, so it is skipped rather than guessed at.
 
 Each resolved account becomes its own limits row on the Limits page. `accountName` is the switch nickname, falling back to the uid, because two personal accounts are otherwise identical on screen. `providerCollapseKey()` in the shared limits module lists `workbuddy` alongside `claude`, `codex`, `alibaba` and the rest, which is what keeps the aggregate from folding the rows into one; its `accountKey` is the account uid, so it is stable across platforms.
@@ -135,8 +137,8 @@ Two details that are easy to get wrong:
 - personal and enterprise billing mapping, including the unlimited enterprise plan;
 - an empty active-package list staying visible as configured;
 - a sealed credential reporting `encrypted` rather than a missing sign-in;
-- the app file winning over the switch fallback, and the fallback answering only
-  when the app file is sealed or absent;
+- the switch accounts winning over the app file, and the app file answering only
+  when the switch file has nothing usable;
 - one limits row per resolved account, and a per-account refresh asking only for
   the account it names;
 - the collapsed Home row summing the accounts, and a sum it cannot compute
