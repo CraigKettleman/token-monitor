@@ -1761,7 +1761,11 @@ test('settingsForRenderer strips provider cookies before they reach the renderer
     assert.ok(rendererOmittedAccountKeys().includes(key));
   }
   assert.doesNotMatch(body, /workbuddyLocalApp/);
-  assert.doesNotMatch(main, /workbuddySession|workbuddyBrowserSession/);
+  // The renderer's settings must not carry a WorkBuddy session. The check is
+  // scoped to the settings projection rather than to the whole main process:
+  // `electronLimitsDeps()` legitimately hands an account enumerator to the
+  // limits collector, and that object never travels this path.
+  assert.doesNotMatch(body, /workbuddySession|workbuddyBrowserSession/);
   assert.doesNotMatch(body, /workbuddyBrowserSessionEnabled: settings\?\.workbuddyBrowserSessionEnabled/);
   // That redactor must name the fields it forwards. A spread of the stored
   // profile hands any field added later to the renderer verbatim, which is how
@@ -2812,7 +2816,7 @@ test('Home limits groups multiple MiMo accounts like Codex', () => {
     /const groupProvider = \{\s*provider: providerId,\s*status: 'ok',\s*windows: \[\],\s*accountGroup: true,\s*groupAccounts: providers\s*\};/
   );
   assert.match(frameBody, /planText: count \? limitGroupCountText\(providerId, count\) : ''/);
-  assert.match(groupBody, /renderLimitProviderGroupFrame\(\s*providerId, label, providers, color, \{ count: providers\.length, markId \}/);
+  assert.match(groupBody, /renderLimitProviderGroupFrame\(\s*providerId, label, providers, color, \{\s*count: providers\.length,\s*markId,\s*headerWindow,\s*fold\s*\}/);
   assert.match(viewBody('limitGroupCountText', 'renderLimitProviderGroup'), /settings\.\$\{providerId\}\.nAccounts/);
 
   // The page's dispatch is by account count with no provider branch left.

@@ -15,6 +15,11 @@ const WORKBUDDY_AUTH_FILE_NAME = 'workbuddy-desktop.info';
 const WORKBUDDY_LOGOUT_MARKER_SUFFIX = '.logged-out';
 const WORKBUDDY_AUTH_FILE_MAX_BYTES = 1024 * 1024;
 const WORKBUDDY_SESSION_EXPIRY_SKEW_MS = 30 * 1000;
+// workbuddy-switch keeps every signed-in WorkBuddy account here, already
+// decrypted. Token Monitor never writes to it and never opens the app's own
+// envelope; this is a read of a file the user's own tooling produced.
+const WORKBUDDY_SWITCH_ACCOUNTS_FILE = path.join('.wb-switch', 'accounts.json');
+const WORKBUDDY_SWITCH_ACCOUNTS_MAX_BYTES = 4 * 1024 * 1024;
 // Newer WorkBuddy builds seal individual credential fields with the key their
 // own runtime holds, so `auth.accessToken` is a `{$wbEncrypted: 1, envelope: …}`
 // shell rather than a string. Token Monitor cannot open that envelope, and the
@@ -200,6 +205,61 @@ function normalizeStoredSession(value, now = Date.now()) {
   return inspectStoredSession(value, now).session;
 }
 
+// One workbuddy-switch entry -> the session shape the rest of this module
+// already speaks. A partial entry is skipped rather than repaired, because a
+// repaired account would silently under-report its own balance.
+function sessionFromSwitchAccount(entry, now) {
+  if (!entry || typeof entry !== 'object') return null;
+  const accessToken = cleanText(entry.access_token);
+  const userId = cleanText(entry.uid);
+  if (!accessToken || !userId) return null;
+  const expiresAt = numberOrNull(entry.expiresAt);
+  return {
+    accessToken,
+    userId,
+    enterpriseId: cleanText(entry.enterpriseId),
+    departmentInfo: '',
+    domain: cleanText(entry.domain),
+    accountType: 'personal',
+    // The nickname, falling back to the uid, so an unnamed account still has a
+    // stable title of its own on the limits row.
+    accountName: cleanText(entry.nickname) || userId,
+    expiresAt,
+    expired: expiresAt !== null && expiresAt <= now + WORKBUDDY_SESSION_EXPIRY_SKEW_MS
+  };
+}
+
+// The fallback source, read only when the app's own file yields no usable
+// session. Absent, unreadable or malformed all mean the same thing here — no
+// accounts from this source — because the caller already has a reason to fall
+// back and a second one would only change the message.
+function readSwitchSessions(homeDir, fsApi, now) {
+  let parsed;
+  try {
+    const raw = readRegularFileNoFollow(path.join(homeDir, WORKBUDDY_SWITCH_ACCOUNTS_FILE), {
+      fs: fsApi,
+      description: 'workbuddy-switch accounts file',
+      encoding: 'utf8',
+      maxBytes: WORKBUDDY_SWITCH_ACCOUNTS_MAX_BYTES
+    });
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const seen = new Set();
+  const sessions = [];
+  for (const entry of parsed) {
+    const session = sessionFromSwitchAccount(entry, now);
+    // A uid appears once: the same account listed twice would double its
+    // credits in the merged response.
+    if (!session || seen.has(session.userId)) continue;
+    seen.add(session.userId);
+    sessions.push(session);
+  }
+  return sessions;
+}
+
 function readSessionFile(filePath, fsApi = fs, now = Date.now()) {
   const absent = { session: null, reason: WORKBUDDY_SESSION_READ_REASONS.absent };
   if (!filePath) return absent;
@@ -240,7 +300,12 @@ function sessionInfo(session, reason = '') {
     enterpriseId: session.enterpriseId,
     departmentInfo: session.departmentInfo,
     domain: session.domain,
-    accountType: session.accountType
+    accountType: session.accountType,
+    // The title the limits row shows. Only the switch fallback carries one; the
+    // app file describes a single account, whose row the plan word already
+    // titles. Kept out of the object entirely when empty so a caller spreading
+    // this into a request never sends an empty name as an identity.
+    ...(session.accountName ? { accountName: session.accountName } : {})
   };
 }
 
@@ -263,6 +328,10 @@ function createWorkbuddyLocalAuth(deps = {}) {
       ? [deps.authDirectory]
       : authDirectoriesForPlatform(platform, homeDir, env)
     : [];
+  // An injected authDirectory means the caller supplied the whole environment,
+  // so the switch fallback is off: reading the real home directory from a test
+  // that asked for one fixture would make the result depend on the machine.
+  const switchHomeDir = supported && !deps.authDirectory ? homeDir : null;
   const fetcher = typeof deps.fetch === 'function'
     ? deps.fetch
     : typeof globalThis.fetch === 'function'
@@ -288,27 +357,36 @@ function createWorkbuddyLocalAuth(deps = {}) {
     return { session: null, reason: WORKBUDDY_SESSION_READ_REASONS.absent };
   }
 
-  function getSessionInfo() {
+  // Every account the billing request should cover, in the order the sources
+  // are trusted. The app's own file is the authority: it is what the app itself
+  // wrote, it needs no third-party tool, and it describes the account the user is
+  // actually signed in as. workbuddy-switch is the fallback, and it is the only
+  // source that survives the app sealing its own fields — but it only speaks up
+  // when the app file gave nothing usable, so a normal install reads exactly what
+  // it read before this existed.
+  function resolveSessions() {
+    const checkedAt = now();
     const { session, reason } = locateSession();
-    if (!session) return sessionInfo(null, reason);
-    return session.expired
-      ? sessionInfo(null, WORKBUDDY_SESSION_READ_REASONS.expired)
-      : sessionInfo(session);
+    if (session && !session.expired) return { sessions: [session], reason: '' };
+    const switched = switchHomeDir
+      ? readSwitchSessions(switchHomeDir, fsApi, checkedAt).filter((entry) => !entry.expired)
+      : [];
+    if (switched.length > 0) return { sessions: switched, reason: '' };
+    // Nothing usable anywhere: report why the app file failed, which is the
+    // reason that tells the user what to do about it.
+    return {
+      sessions: [],
+      reason: session && session.expired ? WORKBUDDY_SESSION_READ_REASONS.expired : reason
+    };
   }
 
-  async function request(url, init = {}, expectedSession = null) {
-    const requestInit = sanitizeRequestInit(init);
-    if (!isAllowedWorkbuddyApiUrl(url, requestInit.method)) {
-      throw authError('unavailable', 'WorkBuddy billing endpoint is not allowed');
-    }
-    const { session, reason } = locateSession();
-    if (!session) throw authError('notConfigured', sessionUnavailableMessage(reason));
-    if (session.expired) throw authError('unauthorized', 'WorkBuddy app session has expired');
-    if (!matchesExpectedSession(expectedSession, session)) {
-      throw authError('unauthorized', 'WorkBuddy app session changed during the billing request');
-    }
-    if (!fetcher) throw authError('unavailable', 'WorkBuddy billing transport is unavailable');
+  function getSessionInfo() {
+    const { sessions, reason } = resolveSessions();
+    if (sessions.length === 0) return sessionInfo(null, reason);
+    return sessionInfo(sessions[0]);
+  }
 
+  function headersFor(session, requestInit) {
     const headers = {
       ...requestInit.headers,
       Accept: requestInit.headers.Accept || 'application/json',
@@ -322,18 +400,112 @@ function createWorkbuddyLocalAuth(deps = {}) {
     }
     if (session.domain) headers['X-Domain'] = session.domain;
     if (session.departmentInfo) headers['X-Department-Info'] = session.departmentInfo;
-    const response = await fetcher(url, { ...requestInit, headers });
+    return headers;
+  }
+
+  // The billing response nests its rows at data.Response.Data.Accounts. Merging
+  // there is what makes the downstream parser see every account: each row
+  // already carries its own AccountId, so they stay distinguishable inside the
+  // combined total.
+  function mergeAccountRows(bodies) {
+    if (bodies.length === 1) return bodies[0];
+    const [first] = bodies;
+    const rows = [];
+    for (const body of bodies) {
+      const accounts = body?.data?.Response?.Data?.Accounts;
+      if (Array.isArray(accounts)) rows.push(...accounts);
+    }
+    if (rows.length === 0) return first;
+    const merged = JSON.parse(JSON.stringify(first));
+    merged.data.Response.Data.Accounts = rows;
+    merged.data.Response.Data.TotalCount = rows.length;
+    return merged;
+  }
+
+  async function requestAccount(url, requestInit, session) {
+    const response = await fetcher(url, { ...requestInit, headers: headersFor(session, requestInit) });
+    // A response without json() is handed back as-is and merged around, which is
+    // what a caller that only looks at status expects to receive.
+    if (typeof response?.json !== 'function') return { response, body: null };
+    // The body is read once here and handed on as a plain document, so the
+    // caller's own json() call keeps working on the merged result. A response
+    // whose body cannot be parsed is passed on as if it had none.
+    let body = null;
+    try {
+      body = await response.json();
+    } catch (_) {
+      // body stays null
+    }
+    return { response, body };
+  }
+
+  function mergedResponse(response, body) {
+    if (body === null) return response;
+    return {
+      ok: response.ok,
+      status: response.status,
+      headers: response.headers,
+      json: async () => body
+    };
+  }
+
+  async function request(url, init = {}, expectedSession = null) {
+    const requestInit = sanitizeRequestInit(init);
+    if (!isAllowedWorkbuddyApiUrl(url, requestInit.method)) {
+      throw authError('unavailable', 'WorkBuddy billing endpoint is not allowed');
+    }
+    const { sessions, reason } = resolveSessions();
+    if (sessions.length === 0) {
+      // An expired session is not a missing one: the app is signed in and the
+      // user has to sign in again, which is a different instruction to the user
+      // and a different status to the renderer.
+      if (reason === WORKBUDDY_SESSION_READ_REASONS.expired) {
+        throw authError('unauthorized', 'WorkBuddy app session has expired');
+      }
+      throw authError('notConfigured', sessionUnavailableMessage(reason));
+    }
+    if (!fetcher) throw authError('unavailable', 'WorkBuddy billing transport is unavailable');
+
+    // A caller that names one account gets exactly that account back, so the
+    // limits layer can publish one row per account. Without a name the request
+    // fans out and merges, which is what a single row wants.
+    const wanted = cleanText(expectedSession?.userId);
+    const selected = wanted
+      ? sessions.filter((session) => session.userId === wanted)
+      : sessions;
+    if (selected.length === 0) {
+      throw authError('unauthorized', 'WorkBuddy app session changed during the billing request');
+    }
+
+    const results = await Promise.all(selected.map(async (session) => {
+      try {
+        return await requestAccount(url, requestInit, session);
+      } catch (error) {
+        // One rejected account must not blank the whole row: the accounts that
+        // did answer still describe a real balance.
+        return { error };
+      }
+    }));
+    const fulfilled = results.filter((result) => !result.error);
+    if (fulfilled.length === 0) throw results[0].error;
+
     if (expectedSession) {
-      const { session: latestSession } = locateSession();
-      if (!latestSession || latestSession.expired || !matchesExpectedSession(expectedSession, latestSession)) {
+      // Re-resolved rather than checked against the account the request ran as:
+      // the app file can be rewritten mid-request, and the caller's expectation
+      // has to hold against what is on disk now, not against what it matched at
+      // the start of the call.
+      const { sessions: latest } = resolveSessions();
+      if (!latest.some((session) => matchesExpectedSession(expectedSession, session))) {
         throw authError('unauthorized', 'WorkBuddy app session changed during the billing request');
       }
     }
-    return response;
+    const first = fulfilled[0];
+    return mergedResponse(first.response, mergeAccountRows(fulfilled.map((result) => result.body)));
   }
 
   return {
     getSessionInfo,
+    sessions: () => resolveSessions().sessions.map((session) => sessionInfo(session)),
     request,
     dispose() {}
   };
@@ -346,6 +518,8 @@ module.exports = {
   WORKBUDDY_LOGOUT_MARKER_SUFFIX,
   WORKBUDDY_SESSION_EXPIRY_SKEW_MS,
   WORKBUDDY_SESSION_READ_REASONS,
+  WORKBUDDY_SWITCH_ACCOUNTS_FILE,
+  WORKBUDDY_SWITCH_ACCOUNTS_MAX_BYTES,
   authDirectoriesForPlatform,
   authDirectoryForPlatform,
   createWorkbuddyLocalAuth,
@@ -353,5 +527,7 @@ module.exports = {
   isAllowedWorkbuddyApiUrl,
   isSupportedWorkbuddyLocalAppPlatform,
   normalizeStoredSession,
-  sanitizeRequestInit
+  readSwitchSessions,
+  sanitizeRequestInit,
+  sessionFromSwitchAccount
 };

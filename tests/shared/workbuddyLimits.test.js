@@ -218,7 +218,7 @@ test('fetchWorkbuddyLimits sends the private personal billing request without ex
 
 test('fetchWorkbuddyLimits uses the WorkBuddy app session without asking users for a token', async () => {
   const requests = [];
-  const provider = await fetchWorkbuddyLimits(
+  const [provider] = await fetchWorkbuddyLimits(
     { workbuddyDesktopSessionEnabled: true },
     {
       env: {},
@@ -467,6 +467,8 @@ test('the limits collector dispatches the WorkBuddy provider through the shared 
 // the outcome. The row has to name that instead of reusing the sign-in prompt.
 test('fetchWorkbuddyLimits names an app-sealed credential instead of asking for a sign-in', async () => {
   let requests = 0;
+  // A sealed credential is answered before any transport is built, so this row
+  // is a single provider rather than the per-account array.
   const provider = await fetchWorkbuddyLimits(
     {
       workbuddyDesktopSessionEnabled: true,
@@ -490,7 +492,7 @@ test('fetchWorkbuddyLimits names an app-sealed credential instead of asking for 
 });
 
 test('other WorkBuddy session read reasons keep the existing sign-in row', async () => {
-  const provider = await fetchWorkbuddyLimits(
+  const [provider] = await fetchWorkbuddyLimits(
     {
       workbuddyDesktopSessionEnabled: true,
       workbuddyLocalSessionReason: 'absent'
@@ -544,4 +546,149 @@ test('the sealed-credential hint stays inside the desktop provider lane', async 
   assert.equal(requests, 0);
   assert.equal(provider.status, 'notConfigured');
   assert.equal(Object.hasOwn(provider, 'actionRequired'), false);
+});
+
+// The desktop lane answers once per signed-in account, so the accounts are only
+// distinguishable by what the request proved it ran as. These pin that each row
+// carries its own account, its own balance, and a title the user can recognize.
+
+const LOCAL_ACCOUNTS = [
+  { userId: 'user-a', accountName: 'Account A', accountType: 'personal', enterpriseId: '', domain: '', departmentInfo: '' },
+  { userId: 'user-b', accountName: 'Account B', accountType: 'personal', enterpriseId: '', domain: '', departmentInfo: '' }
+];
+
+function accountBillingFetch(remainingByUser) {
+  return async (url, init, expectedSession) => {
+    const remaining = remainingByUser[expectedSession?.userId];
+    if (remaining === undefined) throw new Error(`unexpected account ${expectedSession?.userId}`);
+    return response({
+      data: {
+        Response: {
+          Data: {
+            Accounts: [{
+              AccountId: expectedSession.userId,
+              CycleCapacitySizePrecise: 100,
+              CycleCapacityRemainPrecise: remaining
+            }]
+          }
+        }
+      }
+    });
+  };
+}
+
+test('fetchWorkbuddyLimits reports one row per signed-in app account', async () => {
+  const requested = [];
+  const providers = await fetchWorkbuddyLimits(
+    { workbuddyDesktopSessionEnabled: true },
+    {
+      env: {},
+      now: () => PERSONAL_REQUEST_NOW,
+      workbuddySessions: () => LOCAL_ACCOUNTS,
+      workbuddyFetch: async (url, init, expectedSession) => {
+        requested.push(expectedSession.userId);
+        return accountBillingFetch({ 'user-a': 70, 'user-b': 25 })(url, init, expectedSession);
+      }
+    }
+  );
+
+  assert.deepEqual(requested, ['user-a', 'user-b']);
+  assert.equal(providers.length, 2);
+  assert.deepEqual(providers.map((provider) => provider.accountName), ['Account A', 'Account B']);
+  assert.deepEqual(providers.map((provider) => provider.windows[0].remaining), [70, 25]);
+  // Distinct account keys are what keeps the aggregate from folding the two rows
+  // back into one.
+  assert.notEqual(providers[0].accountKey, providers[1].accountKey);
+  assert.ok(providers.every((provider) => provider.status === 'ok'));
+});
+
+test('one account failing does not blank the accounts that answered', async () => {
+  const providers = await fetchWorkbuddyLimits(
+    { workbuddyDesktopSessionEnabled: true },
+    {
+      env: {},
+      now: () => PERSONAL_REQUEST_NOW,
+      workbuddySessions: () => LOCAL_ACCOUNTS,
+      workbuddyFetch: async (url, init, expectedSession) => {
+        if (expectedSession.userId === 'user-b') throw new Error('this account is unreachable');
+        return accountBillingFetch({ 'user-a': 70 })(url, init, expectedSession);
+      }
+    }
+  );
+
+  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'unavailable']);
+  assert.deepEqual(providers.map((provider) => provider.accountName), ['Account A', 'Account B']);
+  assert.equal(providers[0].windows[0].remaining, 70);
+});
+
+test('a per-account refresh asks only for the account it names', async () => {
+  const requested = [];
+  const deps = {
+    env: {},
+    now: () => PERSONAL_REQUEST_NOW,
+    workbuddySessions: () => LOCAL_ACCOUNTS,
+    workbuddyFetch: async (url, init, expectedSession) => {
+      requested.push(expectedSession.userId);
+      return accountBillingFetch({ 'user-a': 70, 'user-b': 25 })(url, init, expectedSession);
+    }
+  };
+  const [byName] = await fetchWorkbuddyLimits(
+    { workbuddyDesktopSessionEnabled: true, limitRefreshScope: { provider: 'workbuddy', accountName: 'Account B' } },
+    deps
+  );
+  assert.deepEqual(requested, ['user-b']);
+  assert.equal(byName.windows[0].remaining, 25);
+
+  requested.length = 0;
+  const [byKey] = await fetchWorkbuddyLimits(
+    {
+      workbuddyDesktopSessionEnabled: true,
+      limitRefreshScope: { provider: 'workbuddy', accountKey: workbuddyAccountKey('', 'user-a', '', '') }
+    },
+    deps
+  );
+  assert.deepEqual(requested, ['user-a']);
+  assert.equal(byKey.windows[0].remaining, 70);
+});
+
+test('a refresh scope naming no signed-in account refreshes nothing', async () => {
+  let requests = 0;
+  const provider = await fetchWorkbuddyLimits(
+    {
+      workbuddyDesktopSessionEnabled: true,
+      limitRefreshScope: { provider: 'workbuddy', accountName: 'Not Signed In' }
+    },
+    {
+      env: {},
+      now: () => PERSONAL_REQUEST_NOW,
+      workbuddySessions: () => LOCAL_ACCOUNTS,
+      workbuddyFetch: async () => { requests += 1; return response({}); }
+    }
+  );
+
+  assert.equal(requests, 0);
+  assert.equal(provider.status, 'notConfigured');
+});
+
+test('a desktop account is never read under another account label', async () => {
+  const seen = [];
+  await fetchWorkbuddyLimits(
+    { workbuddyDesktopSessionEnabled: true },
+    {
+      env: {},
+      now: () => PERSONAL_REQUEST_NOW,
+      workbuddySessions: () => LOCAL_ACCOUNTS,
+      workbuddyFetch: async (url, init, expectedSession) => {
+        seen.push({ userId: expectedSession.userId, accountType: expectedSession.accountType });
+        return accountBillingFetch({ 'user-a': 70, 'user-b': 25 })(url, init, expectedSession);
+      }
+    }
+  );
+
+  // The transport selects the account by the session it is handed, so a row that
+  // named the wrong account would silently report somebody else's balance.
+  assert.deepEqual(seen, [
+    { userId: 'user-a', accountType: 'personal' },
+    { userId: 'user-b', accountType: 'personal' }
+  ]);
 });

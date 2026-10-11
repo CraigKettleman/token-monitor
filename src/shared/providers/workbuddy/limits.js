@@ -349,12 +349,9 @@ async function fetchWorkbuddyLimits(options = {}, deps = {}) {
   const env = deps.env || process.env;
   const now = (deps.now || Date.now)();
   const updatedAt = new Date(now).toISOString();
+  // Only the token lane reads these here; the desktop lane reads them per
+  // account inside fetchWorkbuddyAccount, so they must not be resolved twice.
   const token = workbuddyAccessToken(env, options);
-  const userId = workbuddyUserId(env, options);
-  const enterpriseId = workbuddyEnterpriseId(env, options);
-  const domain = workbuddyDomain(env, options);
-  const departmentInfo = workbuddyDepartmentInfo(env, options);
-  const accountType = cleanSecret(options.workbuddyAccountType);
   const sessionReason = cleanSecret(options.workbuddyLocalSessionReason);
   const localAppUnsupported = !token && options.workbuddyDesktopSessionSupported === false;
   // The app owns the credential and sealed it: the generic not-configured row
@@ -378,6 +375,37 @@ async function fetchWorkbuddyLimits(options = {}, deps = {}) {
   };
 
   if (localAppUnsupported) return normalizeLimitProvider({ ...source, status: 'unavailable' });
+  // A sealed credential names its own outcome before any transport is built: no
+  // request could succeed and the user has to be told why. This is also the
+  // shape a host without an account enumerator keeps, so the encrypted row does
+  // not change meaning depending on what the host wired up.
+  if (localAppSessionEncrypted && !hasSessionEnumerator(deps)) {
+    return normalizeLimitProvider({
+      ...source,
+      status: 'notConfigured',
+      actionRequired: WORKBUDDY_SESSION_ENCRYPTED_ACTION
+    });
+  }
+  // The desktop lane covers every signed-in account, so each one becomes its own
+  // row. The token lane stays single: an explicit token names exactly one account.
+  if (useLocalApp) {
+    const accounts = workbuddyLocalAccounts(deps);
+    // Nothing signed in: the sealed credential is the reason that changed, so it
+    // is the one to report.
+    if (accounts.length === 0) {
+      return normalizeLimitProvider({
+        ...source,
+        status: 'notConfigured',
+        ...(localAppSessionEncrypted ? { actionRequired: WORKBUDDY_SESSION_ENCRYPTED_ACTION } : {})
+      });
+    }
+    // A single-row refresh names the account it wants; without this every
+    // per-account refresh would re-query all of them.
+    const scope = options.limitRefreshScope?.provider === 'workbuddy' ? options.limitRefreshScope : null;
+    const selected = scope ? accounts.filter((account) => matchesLocalScope(account, scope)) : accounts;
+    if (selected.length === 0) return normalizeLimitProvider({ ...source, status: 'notConfigured' });
+    return Promise.all(selected.map((account) => fetchWorkbuddyAccount(account, source, options, deps, true)));
+  }
   if (localAppSessionEncrypted) {
     return normalizeLimitProvider({
       ...source,
@@ -385,23 +413,76 @@ async function fetchWorkbuddyLimits(options = {}, deps = {}) {
       actionRequired: WORKBUDDY_SESSION_ENCRYPTED_ACTION
     });
   }
-  if (!token && !useLocalApp) return normalizeLimitProvider({ ...source, status: 'notConfigured' });
+  if (!token) return normalizeLimitProvider({ ...source, status: 'notConfigured' });
+  return fetchWorkbuddyAccount(null, source, options, deps, false);
+}
+
+// The sessions the desktop transport can authenticate as. Absent an enumerator
+// (a headless caller, or a host that never wired one) the row falls back to a
+// single merged request, so the provider never disappears over a missing
+// optional dep. An empty array is a real answer — nothing is signed in — and is
+// kept distinct from that fallback.
+// Whether the host can enumerate accounts at all. A host that cannot is running
+// the pre-existing single-row lane, and its session reason still decides the row
+// on its own.
+function hasSessionEnumerator(deps = {}) {
+  return typeof deps.workbuddySessions === 'function';
+}
+
+function workbuddyLocalAccounts(deps = {}) {
+  if (!hasSessionEnumerator(deps)) return [null];
+  try {
+    const sessions = deps.workbuddySessions();
+    return Array.isArray(sessions) ? sessions : [null];
+  } catch (_) {
+    return [null];
+  }
+}
+
+// A refresh scope matches an account by name or by key. The name is what the
+// row shows, and the key is what identifies it across platforms; either is
+// enough to name one account, and one that matches neither is not refreshed
+// rather than refreshed as somebody else.
+function matchesLocalScope(account, scope) {
+  if (!account) return true;
+  const wantedName = cleanSecret(scope.accountName || scope.accountLabel);
+  const wantedKey = cleanSecret(scope.accountKey);
+  if (!wantedName && !wantedKey) return true;
+  return Boolean((wantedName && account.accountName === wantedName)
+    || (wantedKey && workbuddyAccountKey('', account.userId, account.enterpriseId, '') === wantedKey));
+}
+
+async function fetchWorkbuddyAccount(account, source, options = {}, deps = {}, desktopLane = false) {
+  const env = deps.env || process.env;
+  const now = (deps.now || Date.now)();
+  const token = desktopLane ? '' : workbuddyAccessToken(env, options);
+  const userId = account ? account.userId : workbuddyUserId(env, options);
+  const enterpriseId = account ? account.enterpriseId : workbuddyEnterpriseId(env, options);
+  const domain = account ? account.domain : workbuddyDomain(env, options);
+  const departmentInfo = account ? account.departmentInfo : workbuddyDepartmentInfo(env, options);
+  const accountType = account ? account.accountType : cleanSecret(options.workbuddyAccountType);
 
   const endpoint = WORKBUDDY_DEFAULT_ENDPOINT;
-  const headers = useLocalApp
-    ? requestHeaders('', '', '', '', '', '')
+  // The desktop transport injects its own credentials per request, so the
+  // headers it is handed must not repeat the token lane's copy.
+  const headers = desktopLane
+    ? requestHeaders('', '', '', workbuddyLocale(env, options), '', '')
     : requestHeaders(token, userId, enterpriseId, workbuddyLocale(env, options), domain, departmentInfo);
-  const expectedSession = useLocalApp
+  // Naming the account is what selects it at the transport, so a fan-out cannot
+  // read one account's balance under another account's label.
+  const expectedSession = account
     ? {
         authenticated: true,
-        userId,
-        enterpriseId,
-        departmentInfo,
-        domain,
-        accountType
+        userId: account.userId,
+        enterpriseId: account.enterpriseId || '',
+        departmentInfo: account.departmentInfo || '',
+        domain: account.domain || '',
+        accountType: account.accountType || ''
       }
-    : null;
-  const requestDeps = useLocalApp
+    : desktopLane
+      ? { authenticated: true, userId, enterpriseId, departmentInfo, domain, accountType }
+      : null;
+  const requestDeps = desktopLane
     ? {
         ...deps,
         fetch: (url, init) => deps.workbuddyFetch(url, init, expectedSession)
@@ -441,13 +522,22 @@ async function fetchWorkbuddyLimits(options = {}, deps = {}) {
     return normalizeLimitProvider({
       ...source,
       accountKey: resolvedAccountKey,
+      // A desktop account is titled by its own nickname, falling back to the
+      // plan. Two personal accounts are otherwise indistinguishable on screen,
+      // and the plan word is the same for both.
+      accountName: account?.accountName || '',
       accountLabel: isEnterprise ? 'Enterprise' : 'Personal',
       status: 'ok',
       windows: usage.window ? [usage.window] : [],
       ...(balance ? { balance } : {})
     });
   } catch (error) {
-    return normalizeLimitProvider({ ...source, accountKey, status: workbuddyStatus(error) });
+    return normalizeLimitProvider({
+      ...source,
+      accountKey,
+      accountName: account?.accountName || '',
+      status: workbuddyStatus(error)
+    });
   }
 }
 
@@ -460,11 +550,13 @@ module.exports = {
   WORKBUDDY_SESSION_ENCRYPTED_ACTION,
   WORKBUDDY_SESSION_REASON_ENCRYPTED,
   fetchWorkbuddyLimits,
+  matchesLocalScope,
   parseEnterpriseUsage,
   parsePersonalAccounts,
   parsePersonalUsage,
   workbuddyAccessToken,
   workbuddyAccountKey,
+  workbuddyLocalAccounts,
   workbuddyDepartmentInfo,
   workbuddyDomain,
   workbuddyEnterpriseId,

@@ -904,7 +904,10 @@ test('every multi-account Limits group uses its provider-localized account count
   assert.match(view, /const key = GROUP_COUNT_KEYS\[providerId\] \|\| `settings\.\$\{providerId\}\.nAccounts`;/);
   assert.match(view, /return text === key \? '' : text;/);
   assert.match(view, /planText: count \? limitGroupCountText\(providerId, count\) : ''/);
-  assert.match(view, /providerId, label, providers, color, \{ count: providers\.length, markId \}/);
+  // The frame takes the fold and the header's combined window alongside the
+  // count, because a header that states a total still has to say how many
+  // accounts it is standing for.
+  assert.match(view, /providerId, label, providers, color, \{\s*count: providers\.length,\s*markId,\s*headerWindow,\s*fold\s*\}/);
   assert.doesNotMatch(view, /settings\.(claude|codex|mimo|opencode|openrouter|thirdparty)\.nAccounts/);
   for (const provider of ['claude', 'codex', 'mimo', 'opencode', 'openrouter', 'thirdparty']) {
     assert.match(i18n, new RegExp(`'settings\\.${provider}\\.nAccounts'`));
@@ -1711,7 +1714,9 @@ test('Home uses explicit billing labels so Copilot Premium and Chat stay distinc
   assert.match(homeModule, /value\.textContent = window\.value \|\| formatHomeLimitWindowValue\(window, showUsed\);/);
   assert.match(homeModule, /limitProviderCompactWindowPeriodLabel\(row\.providerId, window, row\.windows\)/);
   assert.match(homeModule, /`\$\{periodLabel\} · \$\{resetLabel\}`/);
-  assert.match(valueFormatter, /if \(isCreditsWindow\(window\)\) \{/);
+  // A credits window states its balance unless it was marked as carrying a real
+  // cycle denominator, which is what a collapsed multi-account row does.
+  assert.match(valueFormatter, /if \(isCreditsWindow\(window\) && window\.preferPercent !== true\) \{/);
   assert.match(valueFormatter, /formatCompactMoney\(window\.remaining, window\.currency, state\.settings\?\.compactTokenUnits, currentLocale\(\)\)/);
   assert.match(valueFormatter, /`\$\{formatPercent\(percent\)\} \$\{limitModeSuffix\(showUsed\)\}`/);
   assert.doesNotMatch(i18n, /home\.limit\.(balance|leftPercent|leftAmount)/);
