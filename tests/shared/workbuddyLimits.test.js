@@ -5,10 +5,12 @@ const test = require('node:test');
 
 const {
   WORKBUDDY_DEFAULT_ENDPOINT,
+  WORKBUDDY_INTERNATIONAL_ENDPOINT,
   fetchWorkbuddyLimits,
   parseEnterpriseUsage,
   parsePersonalUsage,
-  workbuddyAccountKey
+  workbuddyAccountKey,
+  workbuddyEndpoint
 } = require('../../src/shared/providers/workbuddy/limits');
 const { collectLimitsOnce } = require('../../src/shared/limits/collector');
 
@@ -600,6 +602,46 @@ test('fetchWorkbuddyLimits reports one row per signed-in app account', async () 
   // back into one.
   assert.notEqual(providers[0].accountKey, providers[1].accountKey);
   assert.ok(providers.every((provider) => provider.status === 'ok'));
+});
+
+test('a WorkBuddy account is billed at its own region endpoint', async () => {
+  const requested = [];
+  const providers = await fetchWorkbuddyLimits(
+    { workbuddyDesktopSessionEnabled: true },
+    {
+      env: {},
+      now: () => PERSONAL_REQUEST_NOW,
+      workbuddySessions: () => [
+        { userId: 'user-cn', accountName: 'Domestic', accountType: 'personal', enterpriseId: '', domain: 'www.workbuddy.cn', departmentInfo: '' },
+        { userId: 'user-ai', accountName: 'International', accountType: 'personal', enterpriseId: '', domain: 'www.workbuddy.ai', departmentInfo: '' }
+      ],
+      workbuddyFetch: async (url, init, expectedSession) => {
+        requested.push(String(url));
+        return accountBillingFetch({ 'user-cn': 70, 'user-ai': 25 })(url, init, expectedSession);
+      }
+    }
+  );
+
+  // Each region refuses the other's credential, so one endpoint cannot serve
+  // both accounts: the domain on the session is what picks the host.
+  assert.deepEqual(requested, [
+    'https://copilot.tencent.com/v2/billing/meter/get-user-resource',
+    'https://www.codebuddy.ai/v2/billing/meter/get-user-resource'
+  ]);
+  assert.ok(providers.every((provider) => provider.status === 'ok'));
+  assert.deepEqual(providers.map((provider) => provider.windows[0].remaining), [70, 25]);
+});
+
+// The TLD is the whole rule, and it is anchored: the product spells one region
+// as both workbuddy.cn and codebuddy.cn, and a domain that merely contains
+// `.ai` somewhere is not the international one.
+test('workbuddyEndpoint resolves the region from the domain suffix', () => {
+  for (const domain of ['www.workbuddy.ai', 'www.codebuddy.ai', 'WWW.WORKBUDDY.AI']) {
+    assert.equal(workbuddyEndpoint(domain), WORKBUDDY_INTERNATIONAL_ENDPOINT, domain);
+  }
+  for (const domain of ['www.codebuddy.cn', 'www.workbuddy.cn', 'workbuddy.ai.example.com', 'myai', '', null, undefined]) {
+    assert.equal(workbuddyEndpoint(domain), WORKBUDDY_DEFAULT_ENDPOINT, String(domain));
+  }
 });
 
 test('one account failing does not blank the accounts that answered', async () => {

@@ -35,7 +35,7 @@ The shared metadata scanner still skips records above 64 KiB, so oversized user 
 
 ## Limits and quota
 
-`fetchWorkbuddyLimits()` in `src/shared/providers/workbuddy/limits.js` owns the request and the response mapping. Both billing paths post to `https://copilot.tencent.com` — `/v2/billing/meter/get-user-resource` for personal accounts and `/v2/billing/meter/get-enterprise-user-usage` when an enterprise id is present. The personal request mirrors the official client's package selection (`ProductCode: p_tcaca`, `Status: [0, 3]`) but aggregates only `Status 0` rows, because the `Status 3` history packages are not part of the spendable balance.
+`fetchWorkbuddyLimits()` in `src/shared/providers/workbuddy/limits.js` owns the request and the response mapping. Both billing paths post to `/v2/billing/meter/get-user-resource` for personal accounts and `/v2/billing/meter/get-enterprise-user-usage` when an enterprise id is present, under a host the account's region picks. The personal request mirrors the official client's package selection (`ProductCode: p_tcaca`, `Status: [0, 3]`) but aggregates only `Status 0` rows, because the `Status 3` history packages are not part of the spendable balance.
 
 `parsePersonalUsage()` fails closed when any active package carries unusable quota data: a partial aggregate would look plausible while silently omitting a package. An account with no active package stays a configured row with zero resources instead of becoming an error.
 
@@ -47,14 +47,27 @@ Within the widget lane, an explicit token still wins when one is actually resolv
 
 ## The app-owned session
 
-`src/electron/providers/workbuddy/localAuth.js` reads the session the installed app writes. On Windows it prefers `%LOCALAPPDATA%` and falls back to `%APPDATA%`; on macOS it reads `~/Library/Application Support`. In both cases the path is `CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`.
+`src/electron/providers/workbuddy/localAuth.js` reads the session the installed app writes. On Windows it prefers `%LOCALAPPDATA%` and falls back to `%APPDATA%`; on macOS it reads `~/Library/Application Support`. In both cases the path is `CodeBuddyExtension/Data/Public/auth/`, and the client picks the file name: `workbuddy-desktop.info` for the domestic client, `workbuddy-desktop-ai.info` for the international one. Both are read from the same directory, domestic first, because that is the file this reader has always taken and two installed clients must not silently change which account is reported. The two files differ only in that name — both hold the same document, and both seal the credential.
 
 Non-obvious constraints that must survive refactors:
 
 - **The first directory with canonical state decides.** Once the preferred location holds the file or a `.logged-out` marker, the reader does not fall back to a legacy directory, so a stale roaming copy cannot revive a session the user ended.
-- **Only the canonical filename is trusted.** A sibling file is never read, even when it looks like a session.
+- **Only the two canonical filenames are trusted.** A sibling file is never read, even when it looks like a session — the backup copies the client leaves beside them carry timestamps and are not among the candidates.
 - **Symlinks and oversized files are refused** through `readRegularFileNoFollow` and the 1 MB cap.
 - **No credential is stored by Token Monitor.** The access token lives in memory for the duration of one billing request: it is never written to settings, logs, or Token Monitor's own wire, and it leaves the machine only inside the allowlisted HTTPS billing request described under [Request contract](#request-contract).
+
+### Two regions
+
+WorkBuddy ships as two products with separate sign-in realms, and a credential from one is rejected by the other's billing host. The region therefore picks the host, and nothing else:
+
+| Region | Sign-in domain | Billing host | Client file |
+| --- | --- | --- | --- |
+| Domestic | `www.workbuddy.cn`, `www.codebuddy.cn` | `https://copilot.tencent.com` | `workbuddy-desktop.info` |
+| International | `www.workbuddy.ai` | `https://www.codebuddy.ai` | `workbuddy-desktop-ai.info` |
+
+`workbuddyEndpoint()` resolves the host from the account's own `domain`, because that is the one field both readers carry in the clear: the switch file writes it, and the app file writes `auth.domain` unsealed even when the credential beside it is not. The rule is the TLD, anchored to the end of the domain — the product spells the domestic region as both `workbuddy.cn` and `codebuddy.cn`, and a host that merely contains `.ai` is not the international one. An empty domain keeps the domestic host, which is what every caller built before regions existed.
+
+Both hosts sit in `WORKBUDDY_API_HOSTS`, the transport's allowlist. It stays a list of exact hosts rather than a pattern, so it still names every host a token can ever reach. The request headers do not change with the region: both hosts answer to the same `requestHeaders()` output, and the account's `domain` already travels in `X-Domain`.
 
 ### Credential encryption
 
@@ -81,7 +94,7 @@ The encrypted row appears only when no account could be read at all. When the sw
 Sealing the credential is not the only reason the app file is insufficient: it also describes **one** account — whichever was active — while a user can be signed in to several. A second source is read first for that reason:
 
 1. **`~/.wb-switch/accounts.json`**, written by the third-party [`workbuddy-switch`](https://github.com/changexbc/workbuddy-switch) tool. It holds every account the user has signed in to, already in plaintext, and it is the only source that can hold more than one.
-2. **The app's own file**, `workbuddy-desktop.info`. Read when the switch file yields nothing usable.
+2. **The app's own file**, `workbuddy-desktop.info` or `workbuddy-desktop-ai.info` depending on which client is installed. Read when the switch file yields nothing usable.
 
 The order matters and is not incidental: the app file can only ever describe the account that is currently active, so reading it first would hide every other account a switch install holds. The app file is the fallback, which is what keeps an install without `workbuddy-switch` reading exactly what it read before this existed.
 
@@ -139,6 +152,8 @@ Two details that are easy to get wrong:
 - a sealed credential reporting `encrypted` rather than a missing sign-in;
 - the switch accounts winning over the app file, and the app file answering only
   when the switch file has nothing usable;
+- the international host and file name, and the domestic pair still winning when
+  both clients are installed;
 - one limits row per resolved account, and a per-account refresh asking only for
   the account it names;
 - the collapsed Home row summing the accounts, and a sum it cannot compute

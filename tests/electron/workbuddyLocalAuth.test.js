@@ -105,6 +105,45 @@ test('WorkBuddy Windows auth prefers LocalAppData and only falls back when it ha
   }
 });
 
+// A machine running only the international client has no domestic file at all,
+// and its own file sits beside the domestic one under the same directory.
+test('WorkBuddy local auth reads the international client session file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'token-monitor-workbuddy-intl-'));
+  const authPath = path.join(root, 'workbuddy-desktop-ai.info');
+  fs.writeFileSync(authPath, JSON.stringify(sessionDocument({
+    account: { uid: 'international-user' },
+    auth: { domain: 'www.workbuddy.ai' }
+  })), 'utf8');
+  try {
+    const auth = createWorkbuddyLocalAuth({ authDirectory: root, platform: 'darwin' });
+    const info = auth.getSessionInfo();
+    assert.equal(info.authenticated, true);
+    assert.equal(info.userId, 'international-user');
+    assert.equal(info.domain, 'www.workbuddy.ai');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Both files describe a different account, so the order cannot be left to the
+// directory listing: the domestic file is the one this reader has always taken.
+test('WorkBuddy local auth prefers the domestic file when both clients are installed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'token-monitor-workbuddy-both-'));
+  fs.writeFileSync(path.join(root, WORKBUDDY_AUTH_FILE_NAME), JSON.stringify(sessionDocument({
+    account: { uid: 'domestic-user' }
+  })), 'utf8');
+  fs.writeFileSync(path.join(root, 'workbuddy-desktop-ai.info'), JSON.stringify(sessionDocument({
+    account: { uid: 'international-user' },
+    auth: { domain: 'www.workbuddy.ai' }
+  })), 'utf8');
+  try {
+    const auth = createWorkbuddyLocalAuth({ authDirectory: root, platform: 'darwin' });
+    assert.equal(auth.getSessionInfo().userId, 'domestic-user');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('WorkBuddy local auth is unsupported on Linux and never reads an injected session path', () => {
   const fixture = createFixture();
   let fileSystemCalls = 0;
@@ -372,6 +411,21 @@ test('WorkBuddy local auth accepts only the exact production billing host', () =
   assert.equal(isAllowedWorkbuddyApiUrl('https://staging-copilot.tencent.com/v2/billing/meter/get-user-resource', 'POST'), false);
   assert.equal(isAllowedWorkbuddyApiUrl('https://billing.copilot.tencent.com/v2/billing/meter/get-user-resource', 'POST'), false);
   assert.equal(isAllowedWorkbuddyApiUrl('http://copilot.tencent.com/v2/billing/meter/get-user-resource', 'POST'), false);
+});
+
+// The international client bills through its own host. It is a second allowed
+// host rather than a pattern, so the allowlist still names every host a token
+// can reach.
+test('WorkBuddy local auth allows the international billing host and nothing near it', () => {
+  const personal = 'https://www.codebuddy.ai/v2/billing/meter/get-user-resource';
+  const enterprise = 'https://www.codebuddy.ai/v2/billing/meter/get-enterprise-user-usage';
+  assert.equal(isAllowedWorkbuddyApiUrl(personal, 'POST'), true);
+  assert.equal(isAllowedWorkbuddyApiUrl(enterprise, 'post'), true);
+  assert.equal(isAllowedWorkbuddyApiUrl(personal, 'GET'), false);
+  assert.equal(isAllowedWorkbuddyApiUrl('https://www.codebuddy.ai/v2/billing/meter/other', 'POST'), false);
+  assert.equal(isAllowedWorkbuddyApiUrl('https://staging.codebuddy.ai/v2/billing/meter/get-user-resource', 'POST'), false);
+  assert.equal(isAllowedWorkbuddyApiUrl('https://api.codebuddy.ai/v2/billing/meter/get-user-resource', 'POST'), false);
+  assert.equal(isAllowedWorkbuddyApiUrl('http://www.codebuddy.ai/v2/billing/meter/get-user-resource', 'POST'), false);
 });
 
 test('WorkBuddy request sanitization never forwards caller authentication material', () => {

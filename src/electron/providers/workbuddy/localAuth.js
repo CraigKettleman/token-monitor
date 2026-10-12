@@ -12,6 +12,10 @@ const {
 } = require('../../../shared/providers/workbuddy/limits');
 
 const WORKBUDDY_AUTH_FILE_NAME = 'workbuddy-desktop.info';
+// The international client writes its own file beside the domestic one. Both
+// live in the same directory and hold the same document, so the region is not
+// what separates them — the client is.
+const WORKBUDDY_INTERNATIONAL_AUTH_FILE_NAME = 'workbuddy-desktop-ai.info';
 const WORKBUDDY_LOGOUT_MARKER_SUFFIX = '.logged-out';
 const WORKBUDDY_AUTH_FILE_MAX_BYTES = 1024 * 1024;
 const WORKBUDDY_SESSION_EXPIRY_SKEW_MS = 30 * 1000;
@@ -41,7 +45,12 @@ const WORKBUDDY_SESSION_READ_REASONS = Object.freeze({
   expired: 'expired'
 });
 const WORKBUDDY_API_HOSTS = new Set([
-  'copilot.tencent.com'
+  'copilot.tencent.com',
+  // The international client bills through its own host. Both are reachable and
+  // each refuses the other region's credential, so the allowlist states the two
+  // hosts the transport may ever carry a token to rather than trusting the
+  // endpoint the caller built.
+  'www.codebuddy.ai'
 ]);
 const WORKBUDDY_API_PATHS = new Set([
   WORKBUDDY_PERSONAL_PATH,
@@ -131,7 +140,14 @@ function authDirectoryForPlatform(platform = process.platform, homeDir = os.home
 
 function authPathCandidates(authDirectory) {
   if (!authDirectory) return [];
-  return [path.join(authDirectory, WORKBUDDY_AUTH_FILE_NAME)];
+  // The domestic file is tried first because it is the one this reader has
+  // always taken: a machine running both clients keeps reporting what it
+  // reported before, and one running only the international client now finds a
+  // session where it previously found none.
+  return [
+    path.join(authDirectory, WORKBUDDY_AUTH_FILE_NAME),
+    path.join(authDirectory, WORKBUDDY_INTERNATIONAL_AUTH_FILE_NAME)
+  ];
 }
 
 function authError(status, message) {
@@ -511,6 +527,7 @@ function createWorkbuddyLocalAuth(deps = {}) {
 
 module.exports = {
   WORKBUDDY_AUTH_FILE_NAME,
+  WORKBUDDY_INTERNATIONAL_AUTH_FILE_NAME,
   WORKBUDDY_AUTH_FILE_MAX_BYTES,
   WORKBUDDY_ENCRYPTED_FIELD_MARKER,
   WORKBUDDY_LOGOUT_MARKER_SUFFIX,

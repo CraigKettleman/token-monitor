@@ -7,6 +7,10 @@ const { runWithProbeDeadline } = require('../../probeDeadline');
 
 const WORKBUDDY_FETCH_TIMEOUT_MS = 12_000;
 const WORKBUDDY_DEFAULT_ENDPOINT = 'https://copilot.tencent.com';
+// WorkBuddy ships in two regions, and each signs its tokens in its own realm:
+// a credential issued for one is rejected by the other's billing host. Both
+// answer with the same document, so the region picks the host and nothing else.
+const WORKBUDDY_INTERNATIONAL_ENDPOINT = 'https://www.codebuddy.ai';
 const WORKBUDDY_PERSONAL_PATH = '/v2/billing/meter/get-user-resource';
 const WORKBUDDY_ENTERPRISE_PATH = '/v2/billing/meter/get-enterprise-user-usage';
 const WORKBUDDY_PRODUCT_CODE = 'p_tcaca';
@@ -338,6 +342,17 @@ function workbuddyStatus(error) {
   return 'unavailable';
 }
 
+// The account's own domain is the region signal, because it is the one field
+// both readers carry in the clear: the switch file writes `www.workbuddy.cn`
+// or `www.workbuddy.ai`, and the app file writes `auth.domain` unsealed even
+// when the credential beside it is not. The TLD decides, since the product
+// spells the same region as both `workbuddy.cn` and `codebuddy.cn`.
+function workbuddyEndpoint(domain) {
+  return /\.ai$/i.test(cleanSecret(domain))
+    ? WORKBUDDY_INTERNATIONAL_ENDPOINT
+    : WORKBUDDY_DEFAULT_ENDPOINT;
+}
+
 function workbuddyAccountKey(token, userId, enterpriseId, identity = '') {
   if (enterpriseId && userId) return hashKey('workbuddy', `enterprise:${enterpriseId}:${userId}`);
   if (userId) return hashKey('workbuddy', `user:${userId}`);
@@ -462,7 +477,7 @@ async function fetchWorkbuddyAccount(account, source, options = {}, deps = {}, d
   const departmentInfo = account ? account.departmentInfo : workbuddyDepartmentInfo(env, options);
   const accountType = account ? account.accountType : cleanSecret(options.workbuddyAccountType);
 
-  const endpoint = WORKBUDDY_DEFAULT_ENDPOINT;
+  const endpoint = workbuddyEndpoint(domain);
   // The desktop transport injects its own credentials per request, so the
   // headers it is handed must not repeat the token lane's copy.
   const headers = desktopLane
@@ -544,6 +559,7 @@ async function fetchWorkbuddyAccount(account, source, options = {}, deps = {}, d
 module.exports = {
   WORKBUDDY_DEFAULT_ENDPOINT,
   WORKBUDDY_ENTERPRISE_PATH,
+  WORKBUDDY_INTERNATIONAL_ENDPOINT,
   WORKBUDDY_FETCH_TIMEOUT_MS,
   WORKBUDDY_PERSONAL_PATH,
   WORKBUDDY_PRODUCT_CODE,
@@ -556,6 +572,7 @@ module.exports = {
   parsePersonalUsage,
   workbuddyAccessToken,
   workbuddyAccountKey,
+  workbuddyEndpoint,
   workbuddyLocalAccounts,
   workbuddyDepartmentInfo,
   workbuddyDomain,
