@@ -215,6 +215,63 @@ test('WorkBuddy reports the app file reason when neither source has a session', 
   }
 });
 
+// The guard exists to catch the app file being rewritten to another account
+// mid-request, not to punish the other source for appearing. Reading both again
+// on the way out would let workbuddy-switch being run during a refresh reject an
+// answer that was fetched correctly under the credential in force at the time.
+test('a switch file appearing mid-request does not reject the app session it was read from', async () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(fixture.authPath, JSON.stringify(sessionDocument()), 'utf8');
+    const auth = createAuth(fixture, {
+      fetch: async (url, init) => {
+        // workbuddy-switch runs while the billing request is in flight.
+        writeSwitch(fixture, [switchAccount()]);
+        return billingResponse(init.headers['X-User-Id']);
+      }
+    });
+
+    const response = await auth.request(
+      BILLING_URL,
+      { method: 'POST' },
+      { authenticated: true, userId: 'app-user', enterpriseId: '', departmentInfo: '', domain: 'copilot.tencent.com', accountType: 'personal' }
+    );
+    assert.equal(response.status, 200);
+  } finally {
+    fs.rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+// The reason the guard is there at all: the app rewrites its file whenever the
+// user switches account, and the balance just read must not be published under
+// the account that replaced it.
+test('an app file rewritten mid-request still rejects the session it no longer holds', async () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(fixture.authPath, JSON.stringify(sessionDocument()), 'utf8');
+    const auth = createAuth(fixture, {
+      fetch: async (url, init) => {
+        fs.writeFileSync(fixture.authPath, JSON.stringify(sessionDocument({
+          account: { uid: 'other-user' },
+          auth: { accessToken: 'other-access-token' }
+        })), 'utf8');
+        return billingResponse(init.headers['X-User-Id']);
+      }
+    });
+
+    await assert.rejects(
+      auth.request(
+        BILLING_URL,
+        { method: 'POST' },
+        { authenticated: true, userId: 'app-user', enterpriseId: '', departmentInfo: '', domain: 'copilot.tencent.com', accountType: 'personal' }
+      ),
+      (error) => error.status === 'unauthorized'
+    );
+  } finally {
+    fs.rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('WorkBuddy skips expired switch accounts instead of reporting their balance', async () => {
   const fixture = createFixture();
   try {

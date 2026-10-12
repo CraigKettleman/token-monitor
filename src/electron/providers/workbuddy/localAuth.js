@@ -150,6 +150,13 @@ function authPathCandidates(authDirectory) {
   ];
 }
 
+// Which reader supplied a session. The two sources answer different questions,
+// so one appearing mid-request must not read as the other one disappearing.
+const WORKBUDDY_SESSION_SOURCES = Object.freeze({
+  switch: 'switch',
+  app: 'app'
+});
+
 function authError(status, message) {
   const error = new Error(message);
   error.status = status;
@@ -380,18 +387,47 @@ function createWorkbuddyLocalAuth(deps = {}) {
   // without workbuddy-switch reads exactly what it read before this existed.
   function resolveSessions() {
     const checkedAt = now();
-    const switched = switchHomeDir
-      ? readSwitchSessions(switchHomeDir, fsApi, checkedAt).filter((entry) => !entry.expired)
-      : [];
-    if (switched.length > 0) return { sessions: switched, reason: '' };
+    const switched = switchedSessions(checkedAt);
+    if (switched.length > 0) return {
+      sessions: switched,
+      source: WORKBUDDY_SESSION_SOURCES.switch,
+      reason: ''
+    };
     const { session, reason } = locateSession();
-    if (session && !session.expired) return { sessions: [session], reason: '' };
+    if (session && !session.expired) return {
+      sessions: [session],
+      source: WORKBUDDY_SESSION_SOURCES.app,
+      reason: ''
+    };
     // Nothing usable anywhere: report why the app file failed, which is the
     // reason that tells the user what to do about it.
     return {
       sessions: [],
+      source: '',
       reason: session && session.expired ? WORKBUDDY_SESSION_READ_REASONS.expired : reason
     };
+  }
+
+  // The accounts the switch file holds, expired ones removed. Read on its own so
+  // a request can re-read the source that supplied its credential without
+  // consulting the other one.
+  function switchedSessions(checkedAt) {
+    return switchHomeDir
+      ? readSwitchSessions(switchHomeDir, fsApi, checkedAt).filter((entry) => !entry.expired)
+      : [];
+  }
+
+  // Re-reads one source. The app file is the mutable one — the app rewrites it
+  // whenever the user switches account — so an expectation about it has to hold
+  // against what it says now. Re-resolving both sources would instead let the
+  // other one appear mid-request and read as the account being removed, which
+  // rejects an answer that was correctly fetched under the credential that was
+  // in force when the request started.
+  function resolveSource(source) {
+    if (source === WORKBUDDY_SESSION_SOURCES.switch) return switchedSessions(now());
+    if (source !== WORKBUDDY_SESSION_SOURCES.app) return [];
+    const { session } = locateSession();
+    return session && !session.expired ? [session] : [];
   }
 
   function getSessionInfo() {
@@ -468,7 +504,7 @@ function createWorkbuddyLocalAuth(deps = {}) {
     if (!isAllowedWorkbuddyApiUrl(url, requestInit.method)) {
       throw authError('unavailable', 'WorkBuddy billing endpoint is not allowed');
     }
-    const { sessions, reason } = resolveSessions();
+    const { sessions, source, reason } = resolveSessions();
     if (sessions.length === 0) {
       // An expired session is not a missing one: the app is signed in and the
       // user has to sign in again, which is a different instruction to the user
@@ -504,11 +540,11 @@ function createWorkbuddyLocalAuth(deps = {}) {
     if (fulfilled.length === 0) throw results[0].error;
 
     if (expectedSession) {
-      // Re-resolved rather than checked against the account the request ran as:
-      // the app file can be rewritten mid-request, and the caller's expectation
-      // has to hold against what is on disk now, not against what it matched at
-      // the start of the call.
-      const { sessions: latest } = resolveSessions();
+      // Re-read from the source that answered rather than checked against the
+      // account the request ran as: the file can be rewritten mid-request, and
+      // the caller's expectation has to hold against what is on disk now, not
+      // against what it matched at the start of the call.
+      const latest = resolveSource(source);
       if (!latest.some((session) => matchesExpectedSession(expectedSession, session))) {
         throw authError('unauthorized', 'WorkBuddy app session changed during the billing request');
       }

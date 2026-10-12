@@ -120,7 +120,7 @@ The Limits page and Home answer different questions, so they present the account
 Two details that are easy to get wrong:
 
 - **The collapsed window carries `preferPercent: true`.** A credits window normally states its balance, because a top-up has no denominator and an amount is all it can state. WorkBuddy's accounts each report a real cycle denominator, so the collapsed row has one too and states a percentage — the way Qoder's row already reads. The marker is explicit rather than inferred from the window's shape, and `homeOverview.js` passes it through when it copies a window onto a Home row.
-- **A sum that cannot be computed is not published.** Fewer than two accounts, or none reporting a denominator, and the entries are returned unchanged: two honest rows are better than one row stating a total it cannot compute.
+- **A sum that cannot be computed is not published.** Fewer than two accounts, or any account that reported no denominator, and the entries are returned unchanged: separate honest rows are better than one row stating a total it left an account out of. The group header follows the same rule, so a group that cannot be summed states its count and stays open.
 
 **This is the only provider that resolves several accounts this way.** Every other multi-account provider reads its own credential store or settings. Applying the same fallback to another provider means repeating this section for it, not generalising the reader.
 

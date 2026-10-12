@@ -4529,6 +4529,10 @@ function handleLimitGroupToggle(event) {
   const row = event.target.closest('.limit-row-group');
   row.classList.toggle('expanded', expanded);
   row.querySelector('.limit-head-foldable')?.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  // Keep the retired state in step: the rows are clipped rather than removed, so
+  // without this a folded group would still be reachable by keyboard.
+  const accordion = row.querySelector('.limit-row-accordion');
+  if (accordion) accordion.inert = !expanded;
   return true;
 }
 

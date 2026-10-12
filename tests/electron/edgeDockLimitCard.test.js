@@ -1771,13 +1771,27 @@ test('only the page folds a WorkBuddy group, and only it starts closed', () => {
   assert.equal(page.classNames.has('has-fold'), true);
   assert.equal(page.classNames.has('expanded'), false);
   assert.equal(page.find('limit-head-foldable').attributes['aria-expanded'], 'false');
+  // Clipping the rows does not take them out of the tab order, so a folded group
+  // has to retire them explicitly or a keyboard user lands on an invisible row.
+  assert.equal(page.find('limit-row-accordion').inert, true);
 
   // The dock card draws the same rows at a glance and has no room to hide half of
   // them behind a click, so it never supplies the state and every group stays
   // open there. The markup is the same; only the collapsed default differs.
   const card = dockView().renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
   assert.equal(card.classNames.has('expanded'), true);
+  assert.equal(card.find('limit-row-accordion').inert, false);
   assert.ok(card.find('limit-row-accordion-inner').text.includes('Account B'));
+});
+
+// Every account reporting "Personal" is why the group blanks the plan cell, but a
+// lone account has no header above it to say the word instead.
+test('a WorkBuddy account keeps its plan word only when it stands alone', () => {
+  const account = workbuddyAccount('user-a', 'Account A', 70, 100);
+  const view = dockView();
+
+  assert.equal(view.limitAccountPlan(account, { grouped: false }), 'Personal');
+  assert.equal(view.limitAccountPlan(account, { grouped: true }), '');
 });
 
 test('a WorkBuddy group whose accounts cannot be summed stays open and unlabelled', () => {
@@ -1792,6 +1806,27 @@ test('a WorkBuddy group whose accounts cannot be summed stays open and unlabelle
 
   assert.equal(group.classNames.has('has-fold'), false);
   assert.equal(group.find('limit-window-text'), null);
+});
+
+// Summing only the accounts that answered would state a total under a header
+// that counts them all, which reads as covering an account it left out.
+test('a WorkBuddy group states no total unless every account contributed to it', () => {
+  const answered = workbuddyAccount('user-a', 'Account A', 70, 100);
+  const silent = {
+    ...workbuddyAccount('user-b', 'Account B', 25, 50),
+    status: 'unavailable',
+    windows: [],
+    balance: null
+  };
+  const view = dockView({}, { limitGroupFold: () => ({ expanded: false }) });
+  const group = view.renderLimitProviderGroup('workbuddy', 'WorkBuddy', [answered, silent], '#12B7F5');
+
+  assert.equal(group.classNames.has('has-fold'), false);
+  // The only figure on screen is the account that answered. A header stating the
+  // two accounts added up would have to invent the half it never received.
+  assert.deepEqual(group.textOf('limit-detail'), ['70/100']);
+  // Home reads the same sum, so it keeps the rows apart for the same reason.
+  assert.equal(view.collapseWorkbuddyAccounts([answered, silent]).length, 2);
 });
 
 test('a WorkBuddy account row reads like a single-account Qoder row', () => {

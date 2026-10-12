@@ -805,26 +805,30 @@
   // and a row that never answered contributes nothing rather than zeroing the
   // total.
   function workbuddyCombinedWindow(providers) {
+    const rows = (Array.isArray(providers) ? providers : []).filter(Boolean);
+    if (rows.length === 0) return null;
     let remaining = 0;
     let limit = 0;
     let used = 0;
-    let counted = 0;
     let currency = '';
     let label = '';
-    for (const provider of providers || []) {
+    for (const provider of rows) {
       const window = (provider?.windows || []).find((entry) => entry?.metric === 'credits')
         || (provider?.windows || [])[0];
       const accountRemaining = optionalFiniteNumber(window?.remaining);
       const accountLimit = optionalFiniteNumber(window?.limit);
-      if (accountRemaining === null || accountLimit === null || accountLimit <= 0) continue;
+      // Every account has to contribute or there is no total to state. Summing
+      // the ones that answered would put a number under a header that counts
+      // them all, so the row would claim to cover an account it left out. A
+      // group in that state keeps its rows apart and each one reports itself.
+      if (accountRemaining === null || accountLimit === null || accountLimit <= 0) return null;
       remaining += accountRemaining;
       limit += accountLimit;
       used += optionalFiniteNumber(window?.used) ?? Math.max(0, accountLimit - accountRemaining);
       currency = currency || window?.currency || provider?.balance?.currency || '';
       label = label || window?.label || 'Credits';
-      counted += 1;
     }
-    if (counted === 0 || limit <= 0) return null;
+    if (limit <= 0) return null;
     return {
       kind: 'billing',
       metric: 'credits',
@@ -846,7 +850,7 @@
   // unfolds.
   //
   // Returns the accounts unchanged when they cannot be summed (one account, or
-  // none that reported a denominator), because a row stating a total it cannot
+  // any account that reported no denominator), because a row stating a total it cannot
   // compute would be worse than two honest rows.
   function collapseWorkbuddyAccounts(providers) {
     const entries = Array.isArray(providers) ? providers.filter(Boolean) : [];
@@ -2259,13 +2263,14 @@
     }),
     // One row per signed-in account under a header that already wears the mark
     // and states the combined balance, so a row is only the account's own name
-    // and figure. The plan cell stays empty for the same reason the OpenRouter
-    // rows blank it: every WorkBuddy account reports "Personal", which would
-    // repeat down the group without telling the rows apart.
+    // and figure. The plan cell is blanked only inside such a group, where every
+    // WorkBuddy account reports "Personal" and the word would repeat down the
+    // rows without telling them apart. A lone account keeps its plan: it has no
+    // header above it, so blanking it would leave the cell with nothing at all.
     workbuddy: (provider, color, { grouped }) => ({
       options: {
         ...(grouped ? { showIcon: false } : {}),
-        ...((provider?.status === 'ok' || provider?.stale) ? { planText: '' } : {})
+        ...(grouped && (provider?.status === 'ok' || provider?.stale) ? { planText: '' } : {})
       }
     }),
     thirdparty: (provider, color, { grouped, sharedFamily }) => {
@@ -2297,8 +2302,9 @@
     codex: () => ({ forecastOnGroup: true }),
     // Every WorkBuddy account reports the same Credits window, so the header can
     // state the whole before an account is opened, and the accounts fold away
-    // underneath it. A group whose windows cannot be summed — no account
-    // answered with a denominator — falls back to the plain count and stays open.
+    // underneath it. A group that cannot be summed — one account short of a
+    // denominator — falls back to the plain count and stays open, so its rows
+    // report themselves rather than sitting under a total they are not part of.
     workbuddy: (providers) => {
       const combined = workbuddyCombinedWindow(providers);
       if (!combined) return {};
@@ -2501,6 +2507,10 @@
       accordion.append(inner);
       row.classList.add('has-fold');
       if (fold.expanded) row.classList.add('expanded');
+      // `grid-template-rows: 0fr` clips the accounts without taking them out of
+      // the tab order or the accessibility tree, so a folded row would still be
+      // reachable by keyboard. `inert` is what actually retires them.
+      accordion.inert = !fold.expanded;
       row.append(accordion);
       return { row, list, groupProvider, head };
     }
