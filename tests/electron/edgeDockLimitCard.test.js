@@ -1829,6 +1829,25 @@ test('a WorkBuddy group states no total unless every account contributed to it',
   assert.equal(view.collapseWorkbuddyAccounts([answered, silent]).length, 2);
 });
 
+// The header states the same credits row the accounts do, and its own copy is
+// appended outside the pass that hides usage items — so it has to honour the
+// setting itself or the row the user switched off comes back on the group.
+test('a hidden WorkBuddy credits item is hidden on the group header too', () => {
+  const accounts = [
+    workbuddyAccount('user-a', 'Account A', 70, 100),
+    workbuddyAccount('user-b', 'Account B', 25, 50)
+  ];
+  const visible = dockView().renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  assert.equal(visible.classNames.has('has-fold'), true);
+
+  const hidden = dockView({ limitProviderHiddenItems: { workbuddy: ['credits'] } })
+    .renderLimitProviderGroup('workbuddy', 'WorkBuddy', accounts, '#12B7F5');
+  // No figure to state before opening, so nothing to fold either: the accounts
+  // report themselves rather than sitting under a row the user turned off.
+  assert.equal(hidden.classNames.has('has-fold'), false);
+  assert.deepEqual(hidden.textOf('limit-detail'), []);
+});
+
 test('a WorkBuddy account row reads like a single-account Qoder row', () => {
   const [row] = [
     workbuddyAccount('user-a', 'Account A', 70, 100)

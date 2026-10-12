@@ -2308,6 +2308,14 @@
     workbuddy: (providers) => {
       const combined = workbuddyCombinedWindow(providers);
       if (!combined) return {};
+      // A hidden item is hidden everywhere, and the header states the same credits
+      // row the accounts do — the account rows drop theirs through
+      // hideUsageItems(), and this one is appended outside that pass. Leaving it
+      // would put back the row the user switched off. With no figure to state the
+      // group has nothing to state before opening it, so it stops folding and its
+      // rows report themselves.
+      const hidden = usageItems.hiddenUsageItemSet(settings()?.limitProviderHiddenItems, 'workbuddy');
+      if (hidden.has(usageItems.limitUsageItemId(combined))) return {};
       return { headerWindow: combined, foldable: true };
     }
   };
